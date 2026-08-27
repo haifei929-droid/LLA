@@ -87,11 +87,19 @@
 - API：`POST /api/materials/next`（搜索→转码→ASR→对齐→三段切分→发布；返回 source_url/source_name/upgrade_available/criteria）；前端素材完成态「获取下一篇」
 - 验证：`test_material_search.py`（规则升级/对齐/管线，fake provider）+ 真实验收（37s 全链路，107 句对齐零乱序零溢出）
 
+### P1-1（P1 Development Spec V1.0）：候选素材 + 难度升级 ✅ 完成
+- 候选管线：VOA 慢速初始 Provider；15–20 分钟硬时长区间（RSS `itunes:duration` 预筛 + 实际音频复核）；音质三档分级（Clear/Acceptable/Poor，`AudioQualityAnalyzer` 输出 SNR/响度/clipping/指纹/版本审计，`AudioQualityReport` 落库）；Transcript 完整性校验（`TranscriptValidator`：覆盖率/句数/词数）；最多 3 候选按 Clear 优先、时长居中、语速排序；Poor/缺失字段永不进入；候选去重（指纹）、批次、淘汰统计（rejection_summary）、有效期
+- 选择与准备：`MaterialPreparationService.prepare`（幂等键；重复请求返回同一 Material；失败保留候选可恢复 + failure_code；成功才创建 `READY` Material 并关联 `source_candidate_id`/`speed_stage`）
+- 难度升级：`DifficultyProgressionService`——读 P0 周测（不修改 P0）生成幂等 `WeeklyGateRecord`；连续 8 训练周 PASS（听写≥80、朗读通过、无强化、周间隔容差 10 天）→ `upgrade_eligible`；提示（`upgrade_prompts`）→ 用户决定（UPGRADE_CONFIRMED 推进一个 stage 并重置计数 / KEEP_CURRENT、DECIDE_LATER 进入 28 天冷却）；STAGE_3 封顶；`profile_version` 随升级递增
+- 真实验收发现并修正：VOA 慢速 15–20 分钟素材位于 feed 深处（199 条中 5 条），PROCESS_LIMIT 6→50 后真实搜索可命中；真实难度流程（8 周→资格→幂等→错误码）运行验证通过
+- 测试：`test_p1_candidates.py`（筛选/排序/去重/幂等/过期/API）+ `test_p1_difficulty.py`（连续/归零/冷却/升级/封顶/幂等/API），全量 77 通过，P0 测试零回归
+
 ## 5. 依赖图与并行策略
 
 ```
 M0 ──┬──→ M1 ──→ M3 ──→ M4 ──→ M5
      └──→ M2（独立，可并行）
+     P1（候选素材 + 难度升级）在 M5 后作为独立里程碑 ✅ 完成
 ```
 
 ## 6. 验收映射表（Spec 31 → 里程碑 → 测试文件）

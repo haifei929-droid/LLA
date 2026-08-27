@@ -11,9 +11,12 @@ from app.core.materials import MaterialStore
 from app.core.progress import TrainingProgressStore
 from app.core.training_events import TrainingEventService
 from app.core.learning_time import LearningTimeService
+from app.core.material_candidates import MaterialCandidateService
+from app.core.material_preparation import MaterialPreparationService
 from app.core.material_search import MaterialSearchService
 from app.core.reading_service import ReadingService
 from app.core.weekly import WeeklyAssessmentService
+from app.core.difficulty_progression import DifficultyProgressionService
 from app.adapters.voa_material import VOALearningEnglishProvider
 from app.adapters.web_material import BBCLearningEnglishProvider
 from app.db.connection import Database
@@ -42,6 +45,9 @@ async def lifespan(app: FastAPI):
         settings,
         providers=[VOALearningEnglishProvider(), BBCLearningEnglishProvider()],
     )
+    app.state.material_candidates = MaterialCandidateService(database, settings)
+    app.state.material_preparation = MaterialPreparationService(database, settings)
+    app.state.difficulty = DifficultyProgressionService(database, WeeklyAssessmentService(database, settings))
     yield
 
 

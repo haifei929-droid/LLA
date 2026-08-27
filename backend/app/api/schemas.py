@@ -82,3 +82,28 @@ class WeeklyTestItemsRequest(BaseModel):
 class RecordingScoreRequest(BaseModel):
     filename: str = Field(min_length=1)
     content_base64: str = Field(min_length=1)
+
+
+class P1CandidateSearchRequest(BaseModel):
+    scope_id: str = Field(default="default")
+    speed_stage: str = "STAGE_1"
+    target_duration_min: float = Field(default=15.0, ge=1)
+    target_duration_max: float = Field(default=20.0, ge=1)
+    max_results: int = Field(default=3, ge=1, le=3)
+
+
+class P1PrepareRequest(BaseModel):
+    scope_id: str = Field(default="default")
+    idempotency_key: str = Field(min_length=1)
+
+
+class P1WeeklyGateRequest(BaseModel):
+    scope_id: str = Field(default="default")
+    training_week_id: str = Field(min_length=1)
+
+
+class P1UpgradeDecisionRequest(BaseModel):
+    scope_id: str = Field(default="default")
+    decision: str
+    prompt_id: str = Field(min_length=1)
+    idempotency_key: str = Field(min_length=1)

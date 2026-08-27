@@ -8,7 +8,7 @@ from pathlib import Path
 from app.adapters.speech import WhisperASRProvider
 from app.adapters.web_material import BBCLearningEnglishProvider, MaterialSource
 from app.config import Settings
-from app.core.audio_quality import AudioQualityAnalyzer
+from app.core.audio_quality import AudioQualityAnalyzer, QualityThresholds
 from app.core.material_recommender import MaterialRecommender
 from app.core.materials import MaterialStore
 from app.db.connection import Database
@@ -32,10 +32,12 @@ class MaterialSearchService:
         self.asr = asr or WhisperASRProvider()
         self.recommender = recommender or MaterialRecommender()
         self.quality = quality or AudioQualityAnalyzer(
-            min_sample_rate=settings.audio_quality_min_sample_rate,
-            min_snr_db=settings.audio_quality_min_snr_db,
-            max_silence_ratio=settings.audio_quality_max_silence_ratio,
-            min_duration_seconds=settings.audio_quality_min_duration_seconds,
+            QualityThresholds(
+                min_sample_rate=settings.audio_quality_min_sample_rate,
+                acceptable_min_snr_db=settings.audio_quality_min_snr_db,
+                max_silence_ratio=settings.audio_quality_max_silence_ratio,
+                min_duration_seconds=settings.audio_quality_min_duration_seconds,
+            )
         )
         self.store = MaterialStore(database)
 

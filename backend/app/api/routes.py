@@ -10,6 +10,10 @@ from app.api.schemas import (
     ComprehensionCheckRequest,
     DictationSubmitRequest,
     MaterialCreateRequest,
+    P1CandidateSearchRequest,
+    P1PrepareRequest,
+    P1UpgradeDecisionRequest,
+    P1WeeklyGateRequest,
     ReadingAssessmentRequest,
     RecordingScoreRequest,
     TimeLogStartRequest,
@@ -20,6 +24,8 @@ from app.api.schemas import (
     WeeklyTestItemDictationRequest,
     WeeklyTestItemsRequest,
 )
+from app.core.material_preparation import MaterialSelectionError
+from app.core.difficulty_progression import DifficultyError
 from app.core.materials import MaterialExistsError, MaterialStore
 from app.core.states import TransitionError
 from app.core.training_events import progress_payload
@@ -112,6 +118,68 @@ def skip_material(material_id: str, request: Request) -> dict[str, object]:
         return request.app.state.material_search.skip(material_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+# ================= P1: material candidates & difficulty progression =================
+
+def _p1_error(exc: MaterialSelectionError | DifficultyError) -> HTTPException:
+    status = 409 if exc.code in ("IDEMPOTENCY_CONFLICT", "PROMPT_ALREADY_RESOLVED") else 400
+    return HTTPException(status_code=status, detail={"code": exc.code, "message": str(exc)})
+
+
+@router.post("/p1/material-candidates/search")
+def p1_search_candidates(payload: P1CandidateSearchRequest, request: Request) -> dict[str, object]:
+    try:
+        return request.app.state.material_candidates.search(
+            scope_id=payload.scope_id,
+            speed_stage=payload.speed_stage,
+            target_duration_min=payload.target_duration_min,
+            target_duration_max=payload.target_duration_max,
+            max_results=payload.max_results,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/p1/material-candidates/{candidate_id}/prepare")
+def p1_prepare_candidate(candidate_id: str, payload: P1PrepareRequest, request: Request) -> dict[str, object]:
+    try:
+        return request.app.state.material_preparation.prepare(
+            candidate_id, payload.scope_id, payload.idempotency_key
+        )
+    except MaterialSelectionError as exc:
+        raise _p1_error(exc) from exc
+
+
+@router.post("/p1/difficulty/weekly-gate")
+def p1_weekly_gate(payload: P1WeeklyGateRequest, request: Request) -> dict[str, object]:
+    try:
+        return request.app.state.difficulty.evaluate_weekly_gate(payload.scope_id, payload.training_week_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/p1/difficulty/profile")
+def p1_difficulty_profile(request: Request, scope_id: str = "default") -> dict[str, object]:
+    return request.app.state.difficulty.get_profile(scope_id)
+
+
+@router.get("/p1/difficulty/prompt")
+def p1_difficulty_prompt(request: Request, scope_id: str = "default") -> dict[str, object]:
+    prompt = request.app.state.difficulty.current_prompt(scope_id)
+    if prompt is None:
+        raise HTTPException(status_code=404, detail="no pending prompt")
+    return prompt
+
+
+@router.post("/p1/difficulty/upgrade-decision")
+def p1_upgrade_decision(payload: P1UpgradeDecisionRequest, request: Request) -> dict[str, object]:
+    try:
+        return request.app.state.difficulty.decide_upgrade(
+            payload.scope_id, payload.prompt_id, payload.decision, payload.idempotency_key
+        )
+    except DifficultyError as exc:
+        raise _p1_error(exc) from exc
 
 
 @router.get("/materials/{material_id}/progress")

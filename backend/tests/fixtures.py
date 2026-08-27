@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+import array
 import math
-import struct
 import wave
 from pathlib import Path
 
@@ -94,12 +94,18 @@ def make_sine_wav(
         wav_file.setnchannels(1)
         wav_file.setsampwidth(2)
         wav_file.setframerate(sample_rate)
+        chunk_size = 16384
         for duration_seconds, amplitude in segments:
             frames = int(duration_seconds * sample_rate)
-            for frame in range(frames):
-                if amplitude <= 0:
-                    sample = 0
-                else:
-                    sample = int(amplitude * math.sin(2 * math.pi * frequency * frame / sample_rate))
-                wav_file.writeframes(struct.pack("<h", sample))
+            for start in range(0, frames, chunk_size):
+                count = min(chunk_size, frames - start)
+                samples = array.array(
+                    "h",
+                    (
+                        int(amplitude * math.sin(2 * math.pi * frequency * (start + i) / sample_rate))
+                        if amplitude > 0 else 0
+                        for i in range(count)
+                    ),
+                )
+                wav_file.writeframes(samples.tobytes())
     return path

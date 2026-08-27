@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import DictationPanel from './DictationPanel.jsx'
 import ReadingPanel from './ReadingPanel.jsx'
 import WeeklyPanel from './WeeklyPanel.jsx'
+import CandidatePanel from './CandidatePanel.jsx'
 
 const blankMaterial = { material_id: '', title: '', audio_path: '', transcript: '' }
 
@@ -16,6 +17,7 @@ function App() {
   const [materials, setMaterials] = useState([])
   const [stats, setStats] = useState(null)
   const [view, setView] = useState('home')
+  const [candidateStage, setCandidateStage] = useState('STAGE_1')
   const [query, setQuery] = useState('')
   const [selected, setSelected] = useState(null)
   const [showImport, setShowImport] = useState(false)
@@ -290,6 +292,7 @@ function App() {
         <button className="card metric action-card" onClick={() => setView('materials')}><span>声音训练素材</span><strong>{materials.length}</strong><p>点击进入素材搜索与训练</p></button>
         <article className="card metric"><span>累计学习</span><strong>{totalMinutes}<small> 分钟</small></strong><p>由活动日志自动汇总</p></article>
         <button className="card metric action-card" onClick={() => setView('weekly')}><span>周测 Gate</span><strong>周测</strong><p>听写与朗读 gate：决定是否推荐下一轮</p></button>
+        <button className="card metric action-card" onClick={() => setView('candidates')}><span>候选素材 · P1</span><strong>候选</strong><p>搜索音质清晰的 15–20 分钟候选，确认后创建正式素材</p></button>
       </section>
 
       <section className="materials">
@@ -327,6 +330,18 @@ function App() {
         <button className="back" onClick={() => setView('home')}>← 返回总览</button>
         <div className="section-heading light"><div><p className="eyebrow">周测 Gate</p><h2>每周质量闸门</h2><p className="muted">根据当周训练内容生成测试；低于 80% 或朗读未达标时不推荐进入下一轮，转入短强化包。</p></div></div>
         <WeeklyPanel onMessage={setMessage} />
+        {message && <p className="notice">{message}</p>}
+      </section>}
+
+      {view === 'candidates' && <section className="module">
+        <button className="back" onClick={() => setView('home')}>← 返回总览</button>
+        <div className="section-heading light"><div><p className="eyebrow">候选素材（P1）</p><h2>自动获取素材</h2><p className="muted">候选先经音质三档分级与 Transcript 校验，你确认后才准备为正式素材。</p></div></div>
+        <CandidatePanel
+          stage={candidateStage}
+          onStageChange={setCandidateStage}
+          onMessage={setMessage}
+          onPrepared={onMaterialImported}
+        />
         {message && <p className="notice">{message}</p>}
       </section>}
 

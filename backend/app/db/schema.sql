@@ -148,6 +148,87 @@ CREATE TABLE IF NOT EXISTS learning_stats (
 
 INSERT OR IGNORE INTO learning_stats(stats_id) VALUES (1);
 
+-- ============ P1: material candidates, quality reports, difficulty ============
+
+CREATE TABLE IF NOT EXISTS material_candidates (
+    candidate_id TEXT PRIMARY KEY,
+    scope_id TEXT NOT NULL DEFAULT 'default',
+    provider TEXT NOT NULL,
+    provider_item_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    source_url TEXT NOT NULL,
+    audio_url TEXT NOT NULL,
+    transcript TEXT NOT NULL,
+    duration_seconds REAL NOT NULL,
+    speed_stage TEXT NOT NULL DEFAULT 'STAGE_1',
+    audio_quality TEXT NOT NULL,
+    audio_quality_report_id TEXT,
+    transcript_status TEXT NOT NULL,
+    candidate_status TEXT NOT NULL DEFAULT 'CANDIDATE',
+    search_batch_id TEXT NOT NULL,
+    content_fingerprint TEXT NOT NULL,
+    idempotency_key TEXT,
+    failure_code TEXT,
+    audio_path TEXT,
+    timestamped_sentences_json TEXT,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    UNIQUE(scope_id, content_fingerprint)
+);
+
+CREATE TABLE IF NOT EXISTS audio_quality_reports (
+    report_id TEXT PRIMARY KEY,
+    candidate_id TEXT,
+    audio_fingerprint TEXT,
+    quality_level TEXT NOT NULL,
+    metrics_json TEXT NOT NULL,
+    threshold_config_version TEXT NOT NULL,
+    analyzer_version TEXT NOT NULL,
+    failure_code TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS training_difficulty_profiles (
+    scope_id TEXT PRIMARY KEY,
+    current_stage TEXT NOT NULL DEFAULT 'STAGE_1',
+    consecutive_pass_weeks INTEGER NOT NULL DEFAULT 0,
+    upgrade_eligible INTEGER NOT NULL DEFAULT 0,
+    last_upgrade_prompt_at TEXT,
+    last_upgrade_decision TEXT,
+    cooldown_until TEXT,
+    last_upgrade_at TEXT,
+    profile_version TEXT NOT NULL DEFAULT '1.0',
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS weekly_gate_records (
+    gate_id TEXT PRIMARY KEY,
+    scope_id TEXT NOT NULL DEFAULT 'default',
+    training_week_id TEXT NOT NULL,
+    stage_at_evaluation TEXT NOT NULL,
+    gate_result TEXT NOT NULL,
+    dictation_score REAL,
+    read_aloud_score TEXT,
+    read_aloud_attempted INTEGER NOT NULL DEFAULT 0,
+    evaluation_reason_codes TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL,
+    UNIQUE(scope_id, training_week_id, stage_at_evaluation)
+);
+
+CREATE TABLE IF NOT EXISTS upgrade_prompts (
+    prompt_id TEXT PRIMARY KEY,
+    scope_id TEXT NOT NULL DEFAULT 'default',
+    stage_at_prompt TEXT NOT NULL,
+    prompt_status TEXT NOT NULL DEFAULT 'PENDING',
+    decision TEXT,
+    idempotency_key TEXT,
+    created_at TEXT NOT NULL,
+    resolved_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_candidates_batch ON material_candidates(search_batch_id, candidate_status);
+CREATE INDEX IF NOT EXISTS idx_gate_records_week ON weekly_gate_records(scope_id, created_at);
+
 CREATE INDEX IF NOT EXISTS idx_sentences_material_part
     ON sentences(material_id, part_no, sequence_no);
 CREATE INDEX IF NOT EXISTS idx_dictation_attempts_sentence

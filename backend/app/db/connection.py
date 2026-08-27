@@ -35,6 +35,13 @@ class Database:
         material_columns = {row["name"] for row in connection.execute("PRAGMA table_info(materials)")}
         if "source_url" not in material_columns:
             connection.execute("ALTER TABLE materials ADD COLUMN source_url TEXT")
+        for column, definition in (
+            ("source_candidate_id", "TEXT"),
+            ("speed_stage", "TEXT NOT NULL DEFAULT 'STAGE_1'"),
+            ("prepare_status", "TEXT NOT NULL DEFAULT 'READY'"),
+        ):
+            if column not in material_columns:
+                connection.execute(f"ALTER TABLE materials ADD COLUMN {column} {definition}")
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
