@@ -3,6 +3,7 @@ import DictationPanel from './DictationPanel.jsx'
 import ReadingPanel from './ReadingPanel.jsx'
 import WeeklyPanel from './WeeklyPanel.jsx'
 import CandidatePanel from './CandidatePanel.jsx'
+import P2Dashboard from './P2Dashboard.jsx'
 
 const blankMaterial = { material_id: '', title: '', audio_path: '', transcript: '' }
 
@@ -293,6 +294,7 @@ function App() {
         <article className="card metric"><span>累计学习</span><strong>{totalMinutes}<small> 分钟</small></strong><p>由活动日志自动汇总</p></article>
         <button className="card metric action-card" onClick={() => setView('weekly')}><span>周测 Gate</span><strong>周测</strong><p>听写与朗读 gate：决定是否推荐下一轮</p></button>
         <button className="card metric action-card" onClick={() => setView('candidates')}><span>候选素材 · P1</span><strong>候选</strong><p>搜索音质清晰的 15–20 分钟候选，确认后创建正式素材</p></button>
+        <button className="card metric action-card" onClick={() => setView('p2')}><span>长期仪表盘 · P2</span><strong>仪表盘</strong><p>时长 / 首次理解 / 记忆深化 / 难度历史</p></button>
       </section>
 
       <section className="materials">
@@ -342,6 +344,13 @@ function App() {
           onMessage={setMessage}
           onPrepared={onMaterialImported}
         />
+        {message && <p className="notice">{message}</p>}
+      </section>}
+
+      {view === 'p2' && <section className="module">
+        <button className="back" onClick={() => setView('home')}>← 返回总览</button>
+        <div className="section-heading light"><div><p className="eyebrow">长期训练仪表盘（P2）</p><h2>观察与解释层</h2><p className="muted">只读视图：时长 / 首次理解曲线 / 周测趋势 / 朗读三维 / 记忆深化 / 难度历史。</p></div></div>
+        <P2Dashboard onMessage={setMessage} />
         {message && <p className="notice">{message}</p>}
       </section>}
 

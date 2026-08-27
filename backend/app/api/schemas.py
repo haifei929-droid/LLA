@@ -107,3 +107,17 @@ class P1UpgradeDecisionRequest(BaseModel):
     decision: str
     prompt_id: str = Field(min_length=1)
     idempotency_key: str = Field(min_length=1)
+
+
+class P2MemoryConfigRequest(BaseModel):
+    scope_id: str = Field(default="default")
+    short_days: int = Field(ge=1)
+    long_days: int = Field(ge=1)
+    min_episodes: int = Field(ge=1)
+    min_dates: int = Field(ge=1)
+
+
+class P2SuggestionActionRequest(BaseModel):
+    scope_id: str = Field(default="default")
+    action: str
+    target: str | None = None

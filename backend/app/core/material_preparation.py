@@ -37,11 +37,13 @@ class MaterialPreparationService:
         database: Database,
         settings: Settings,
         now_fn: Callable[[], datetime] | None = None,
+        history=None,
     ) -> None:
         self.database = database
         self.settings = settings
         self.now_fn = now_fn or (lambda: datetime.now(UTC))
         self.store = MaterialStore(database)
+        self.history = history
 
     def prepare(self, candidate_id: str, scope_id: str, idempotency_key: str) -> dict[str, object]:
         if not idempotency_key.strip():
@@ -113,6 +115,15 @@ class MaterialPreparationService:
                  WHERE material_id = ?
                 """,
                 (candidate_id, candidate["speed_stage"], material.material_id),
+            )
+        if self.history is not None:
+            self.history.record(
+                "default" if scope_id is None else scope_id,
+                "MATERIAL_PREPARED",
+                stage_before=candidate["speed_stage"],
+                stage_after=candidate["speed_stage"],
+                source_record_ids=[candidate_id, material.material_id],
+                reason="candidate prepared into a READY material",
             )
         return {
             "material_id": material.material_id,

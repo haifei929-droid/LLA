@@ -45,10 +45,13 @@ class DifficultyProgressionService:
         database: Database,
         weekly_assessments,
         now_fn: Callable[[], datetime] | None = None,
+        history=None,
     ) -> None:
         self.database = database
         self.weekly_assessments = weekly_assessments
         self.now_fn = now_fn or (lambda: datetime.now(UTC))
+        # Optional P2 observer: records append-only difficulty events.
+        self.history = history
 
     # ---------- profile ----------
 
@@ -154,7 +157,24 @@ class DifficultyProgressionService:
             return {"record": dict(existing), "reused": True}
 
         self._recompute_consecutive(scope_id)
-        return {"record": self._latest_record(scope_id), "reused": False}
+        record = self._latest_record(scope_id)
+        if self.history is not None:
+            occurred = record["created_at"]
+            self.history.record(
+                scope_id, "WEEKLY_GATE_RECORDED",
+                stage_before=stage, stage_after=stage,
+                source_record_ids=[record["gate_id"]],
+                reason=f"gate_result={record['gate_result']}",
+                occurred_at=occurred,
+            )
+            profile = self.get_profile(scope_id)
+            self.history.record(
+                scope_id, "STREAK_UPDATED",
+                stage_before=stage, stage_after=stage,
+                reason=f"consecutive_pass_weeks={profile['consecutive_pass_weeks']}",
+                occurred_at=occurred,
+            )
+        return {"record": record, "reused": False}
 
     def _map_assessment(self, assessment: dict[str, object]) -> tuple[str, float | None, str | None, bool, list[str]]:
         reasons: list[str] = []
@@ -274,6 +294,18 @@ class DifficultyProgressionService:
                 "UPDATE training_difficulty_profiles SET last_upgrade_prompt_at = ? WHERE scope_id = ?",
                 (self.now_fn().isoformat(), scope_id),
             )
+        if self.history is not None:
+            stage = profile["current_stage"]
+            self.history.record(
+                scope_id, "UPGRADE_ELIGIBLE", stage_before=stage, stage_after=stage,
+                reason=f"{STABLE_WEEKS_REQUIRED} consecutive stable passes",
+                occurred_at=self.now_fn().isoformat(),
+            )
+            self.history.record(
+                scope_id, "UPGRADE_PROMPTED", stage_before=stage, stage_after=stage,
+                source_record_ids=[prompt_id], reason="prompt shown to user",
+                occurred_at=self.now_fn().isoformat(),
+            )
         return self.current_prompt(scope_id)
 
     def decide_upgrade(
@@ -334,6 +366,26 @@ class DifficultyProgressionService:
                 """,
                 (decision, idempotency_key, now.isoformat(), prompt_id),
             )
+        stage = profile["current_stage"]
+        if self.history is not None:
+            self.history.record(
+                scope_id, "UPGRADE_DECIDED", stage_before=stage, stage_after=stage,
+                source_record_ids=[prompt_id], actor="USER",
+                reason=f"decision={decision}", occurred_at=now.isoformat(),
+            )
+            if decision == "UPGRADE_CONFIRMED":
+                next_stage = STAGES[STAGES.index(stage) + 1]
+                self.history.record(
+                    scope_id, "STAGE_CHANGED", stage_before=stage, stage_after=next_stage,
+                    source_record_ids=[prompt_id], actor="USER",
+                    reason="confirmed upgrade", occurred_at=now.isoformat(),
+                )
+            else:
+                self.history.record(
+                    scope_id, "COOLDOWN_STARTED", stage_before=stage, stage_after=stage,
+                    source_record_ids=[prompt_id], actor="USER",
+                    reason=f"{decision} -> {COOLDOWN_DAYS}-day cooldown", occurred_at=now.isoformat(),
+                )
         return {
             "prompt_id": prompt_id,
             "decision": decision,

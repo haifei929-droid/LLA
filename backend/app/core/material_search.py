@@ -24,6 +24,7 @@ class MaterialSearchService:
         asr=None,
         recommender: MaterialRecommender | None = None,
         quality: AudioQualityAnalyzer | None = None,
+        history=None,
     ) -> None:
         self.database = database
         self.settings = settings
@@ -40,6 +41,7 @@ class MaterialSearchService:
             )
         )
         self.store = MaterialStore(database)
+        self.history = history
 
     def search_next(self) -> dict[str, object]:
         profile = self._latest_completed_profile()
@@ -114,6 +116,12 @@ class MaterialSearchService:
                 raise KeyError(f"No material exists for {material_id}")
             connection.execute(
                 "UPDATE materials SET status = 'SKIPPED' WHERE material_id = ?", (material_id,)
+            )
+        if self.history is not None:
+            self.history.record(
+                "default", "MATERIAL_SKIPPED",
+                source_record_ids=[material_id], actor="USER",
+                reason="user skipped material",
             )
         return {"material_id": material_id, "status": "SKIPPED"}
 

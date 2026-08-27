@@ -14,6 +14,8 @@ from app.api.schemas import (
     P1PrepareRequest,
     P1UpgradeDecisionRequest,
     P1WeeklyGateRequest,
+    P2MemoryConfigRequest,
+    P2SuggestionActionRequest,
     ReadingAssessmentRequest,
     RecordingScoreRequest,
     TimeLogStartRequest,
@@ -26,6 +28,8 @@ from app.api.schemas import (
 )
 from app.core.material_preparation import MaterialSelectionError
 from app.core.difficulty_progression import DifficultyError
+from app.core.difficulty_history import DifficultyHistoryError
+from app.core.memory_deepening import MemoryConfigError
 from app.core.materials import MaterialExistsError, MaterialStore
 from app.core.states import TransitionError
 from app.core.training_events import progress_payload
@@ -182,6 +186,97 @@ def p1_upgrade_decision(payload: P1UpgradeDecisionRequest, request: Request) -> 
         )
     except DifficultyError as exc:
         raise _p1_error(exc) from exc
+
+
+# ================= P2: dashboard / memory / difficulty history =================
+
+@router.get("/p2/dashboard")
+def p2_dashboard(
+    request: Request,
+    scope_id: str = "default",
+    range_start: str | None = None,
+    range_end: str | None = None,
+    granularity: str = "week",
+) -> dict[str, object]:
+    try:
+        return request.app.state.dashboard.read(
+            scope_id=scope_id, range_start=range_start, range_end=range_end, granularity=granularity
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/p2/memory/backfill")
+def p2_memory_backfill(request: Request, scope_id: str = "default") -> dict[str, object]:
+    created = request.app.state.memory.build_episodes(scope_id)
+    return {"scope_id": scope_id, "episodes_created": created, "backfill": "additive"}
+
+
+@router.get("/p2/memory")
+def p2_memory(request: Request, scope_id: str = "default") -> dict[str, object]:
+    return request.app.state.memory.read_memory(scope_id)
+
+
+@router.get("/p2/memory/config")
+def p2_memory_config_get(request: Request, scope_id: str = "default") -> dict[str, object]:
+    return request.app.state.memory.get_config(scope_id)
+
+
+@router.put("/p2/memory/config")
+def p2_memory_config_put(payload: P2MemoryConfigRequest, request: Request) -> dict[str, object]:
+    try:
+        return request.app.state.memory.save_config(
+            payload.scope_id, short_days=payload.short_days, long_days=payload.long_days,
+            min_episodes=payload.min_episodes, min_dates=payload.min_dates,
+        )
+    except MemoryConfigError as exc:
+        raise HTTPException(status_code=400, detail={"code": exc.code, "message": str(exc)}) from exc
+
+
+@router.get("/p2/memory/suggestions")
+def p2_memory_suggestions(request: Request, scope_id: str = "default") -> dict[str, object]:
+    return request.app.state.memory.generate_suggestions(scope_id)
+
+
+@router.post("/p2/memory/suggestions/action")
+def p2_memory_suggestions_action(payload: P2SuggestionActionRequest, request: Request) -> dict[str, object]:
+    try:
+        return request.app.state.memory.update_preferences(
+            payload.scope_id, action=payload.action, target=payload.target
+        )
+    except MemoryConfigError as exc:
+        raise HTTPException(status_code=400, detail={"code": exc.code, "message": str(exc)}) from exc
+
+
+@router.get("/p2/difficulty/history")
+def p2_difficulty_history(request: Request, scope_id: str = "default") -> dict[str, object]:
+    return request.app.state.difficulty_history.history(scope_id)
+
+
+@router.post("/p2/difficulty/downgrade/suggest")
+def p2_downgrade_suggest(request: Request, scope_id: str = "default") -> dict[str, object]:
+    return request.app.state.difficulty_history.check_downgrade_suggestion(scope_id)
+
+
+@router.post("/p2/difficulty/downgrade/request")
+def p2_downgrade_request(request: Request, scope_id: str = "default") -> dict[str, object]:
+    try:
+        return request.app.state.difficulty_history.downgrade_request(scope_id)
+    except DifficultyHistoryError as exc:
+        raise HTTPException(status_code=400, detail={"code": exc.code, "message": str(exc)}) from exc
+
+
+@router.post("/p2/difficulty/downgrade/confirm")
+def p2_downgrade_confirm(request: Request, scope_id: str = "default") -> dict[str, object]:
+    try:
+        return request.app.state.difficulty_history.downgrade_confirm(scope_id)
+    except DifficultyHistoryError as exc:
+        raise HTTPException(status_code=400, detail={"code": exc.code, "message": str(exc)}) from exc
+
+
+@router.post("/p2/difficulty/downgrade/decline")
+def p2_downgrade_decline(request: Request, scope_id: str = "default") -> dict[str, object]:
+    return request.app.state.difficulty_history.downgrade_decline(scope_id)
 
 
 @router.get("/materials/{material_id}/progress")

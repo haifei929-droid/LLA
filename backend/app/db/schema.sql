@@ -238,6 +238,99 @@ CREATE TABLE IF NOT EXISTS search_audits (
     created_at TEXT NOT NULL
 );
 
+-- ============ P2: dashboard / memory deepening / difficulty history ============
+
+CREATE TABLE IF NOT EXISTS memory_target_occurrences (
+    occurrence_id TEXT PRIMARY KEY,
+    scope_id TEXT NOT NULL DEFAULT 'default',
+    target TEXT NOT NULL,
+    material_id TEXT NOT NULL,
+    sentence_id TEXT NOT NULL,
+    part_no INTEGER,
+    source_kind TEXT NOT NULL DEFAULT 'DICTATION',
+    created_at TEXT NOT NULL,
+    UNIQUE(scope_id, sentence_id, target)
+);
+
+CREATE TABLE IF NOT EXISTS memory_recognition_episodes (
+    episode_id TEXT PRIMARY KEY,
+    scope_id TEXT NOT NULL DEFAULT 'default',
+    target TEXT NOT NULL,
+    occurrence_id TEXT NOT NULL REFERENCES memory_target_occurrences(occurrence_id),
+    sentence_id TEXT NOT NULL,
+    first_exact_listen_count INTEGER,
+    revealed INTEGER NOT NULL DEFAULT 0,
+    hint_used INTEGER NOT NULL DEFAULT 0,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    episode_date TEXT NOT NULL,
+    backfilled INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    UNIQUE(scope_id, sentence_id, target, episode_date)
+);
+
+CREATE TABLE IF NOT EXISTS memory_threshold_configs (
+    scope_id TEXT PRIMARY KEY,
+    short_days INTEGER NOT NULL,
+    long_days INTEGER NOT NULL,
+    min_episodes INTEGER NOT NULL,
+    min_dates INTEGER NOT NULL,
+    config_version TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS review_preferences (
+    scope_id TEXT PRIMARY KEY,
+    suggestions_enabled INTEGER NOT NULL DEFAULT 1,
+    batch_paused INTEGER NOT NULL DEFAULT 0,
+    global_paused INTEGER NOT NULL DEFAULT 0,
+    snoozed_until TEXT,
+    frequency_days INTEGER NOT NULL DEFAULT 7,
+    per_target_disabled_json TEXT NOT NULL DEFAULT '{}',
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS review_suggestions (
+    suggestion_id TEXT PRIMARY KEY,
+    scope_id TEXT NOT NULL DEFAULT 'default',
+    target TEXT NOT NULL,
+    trigger_evidence_json TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'ACTIVE',
+    created_at TEXT NOT NULL,
+    snoozed_until TEXT,
+    UNIQUE(scope_id, target, created_at)
+);
+
+CREATE TABLE IF NOT EXISTS difficulty_events (
+    event_id TEXT PRIMARY KEY,
+    scope_id TEXT NOT NULL DEFAULT 'default',
+    event_type TEXT NOT NULL,
+    occurred_at TEXT NOT NULL,
+    stage_before TEXT,
+    stage_after TEXT,
+    source_record_ids_json TEXT NOT NULL DEFAULT '[]',
+    actor TEXT NOT NULL DEFAULT 'SYSTEM',
+    reason TEXT,
+    policy_version TEXT NOT NULL DEFAULT '1.0',
+    created_at TEXT NOT NULL,
+    UNIQUE(scope_id, event_type, occurred_at)
+);
+
+CREATE TABLE IF NOT EXISTS backfill_audits (
+    audit_id TEXT PRIMARY KEY,
+    scope_id TEXT NOT NULL DEFAULT 'default',
+    source_record_ids_json TEXT NOT NULL,
+    fields_derived_json TEXT NOT NULL,
+    source_schema_version TEXT NOT NULL,
+    metric_version TEXT NOT NULL,
+    reliability TEXT NOT NULL,
+    unavailable_reasons_json TEXT NOT NULL DEFAULT '{}',
+    backfilled_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_occurrences_target ON memory_target_occurrences(scope_id, target, created_at);
+CREATE INDEX IF NOT EXISTS idx_episodes_target ON memory_recognition_episodes(scope_id, target, episode_date);
+CREATE INDEX IF NOT EXISTS idx_difficulty_events_scope ON difficulty_events(scope_id, occurred_at);
+
 CREATE INDEX IF NOT EXISTS idx_candidates_batch ON material_candidates(search_batch_id, candidate_status);
 CREATE INDEX IF NOT EXISTS idx_gate_records_week ON weekly_gate_records(scope_id, created_at);
 
