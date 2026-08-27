@@ -1,0 +1,430 @@
+from __future__ import annotations
+
+import sqlite3
+from pathlib import Path
+
+from fastapi import APIRouter, HTTPException, Request, status
+from fastapi.responses import FileResponse
+
+from app.api.schemas import (
+    ComprehensionCheckRequest,
+    DictationSubmitRequest,
+    MaterialCreateRequest,
+    ReadingAssessmentRequest,
+    RecordingScoreRequest,
+    TimeLogStartRequest,
+    TimeLogStopRequest,
+    WeeklyAssessmentCreateRequest,
+    WeeklyDictationRequest,
+    WeeklyReadingRequest,
+    WeeklyTestItemDictationRequest,
+    WeeklyTestItemsRequest,
+)
+from app.core.materials import MaterialExistsError, MaterialStore
+from app.core.states import TransitionError
+from app.core.training_events import progress_payload
+from app.preprocess.material import MaterialPreprocessError, MaterialPreprocessor, TimestampedSentence
+
+router = APIRouter(prefix="/api")
+
+
+@router.get("/health")
+def health(request: Request) -> dict[str, str]:
+    settings = request.app.state.settings
+    return {
+        "status": "ok",
+        "service": settings.app_name,
+        "environment": settings.environment,
+    }
+
+
+@router.post("/materials", status_code=status.HTTP_201_CREATED)
+def create_material(payload: MaterialCreateRequest, request: Request) -> dict[str, object]:
+    try:
+        material = MaterialPreprocessor().process(
+            material_id=payload.material_id,
+            title=payload.title,
+            audio_path=payload.audio_path,
+            transcript=payload.transcript,
+            timestamped_sentences=[TimestampedSentence(**item.model_dump()) for item in payload.timestamped_sentences],
+            natural_part_boundaries=payload.natural_part_boundaries,
+        )
+        request.app.state.material_store.create(material)
+    except MaterialExistsError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except (MaterialPreprocessError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except sqlite3.IntegrityError as exc:
+        raise HTTPException(status_code=409, detail="Material ID already exists") from exc
+    return {
+        "material_id": material.material_id,
+        "title": material.title,
+        "duration_seconds": material.duration_seconds,
+        "sentence_count": len(material.sentences),
+        "status": material.status,
+    }
+
+
+@router.get("/materials")
+def list_materials(request: Request) -> list[dict[str, object]]:
+    return request.app.state.material_store.list()
+
+
+@router.get("/materials/search")
+def search_materials(request: Request, q: str = "") -> list[dict[str, object]]:
+    return request.app.state.material_store.search(q)
+
+
+@router.get("/materials/{material_id}")
+def get_material(material_id: str, request: Request) -> dict[str, object]:
+    material = request.app.state.material_store.get(material_id)
+    if material is None:
+        raise HTTPException(status_code=404, detail=f"No material exists for {material_id}")
+    return material
+
+
+@router.get("/materials/{material_id}/audio")
+def get_material_audio(material_id: str, request: Request) -> FileResponse:
+    material = request.app.state.material_store.get(material_id)
+    if material is None:
+        raise HTTPException(status_code=404, detail=f"No material exists for {material_id}")
+    audio_path = Path(str(material["audio_path"]))
+    if not audio_path.is_absolute():
+        audio_path = request.app.state.settings.project_root / audio_path
+    if not audio_path.is_file():
+        raise HTTPException(status_code=404, detail="Audio file is not available on the local filesystem")
+    return FileResponse(audio_path)
+
+
+@router.post("/materials/next")
+def search_next_material(request: Request) -> dict[str, object]:
+    """Auto-search the next material by difficulty rules and learning pace."""
+    try:
+        return request.app.state.material_search.search_next()
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.post("/materials/{material_id}/skip")
+def skip_material(material_id: str, request: Request) -> dict[str, object]:
+    """User skips the current material and asks for a different one."""
+    try:
+        return request.app.state.material_search.skip(material_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/materials/{material_id}/progress")
+def get_progress(material_id: str, request: Request) -> dict[str, object]:
+    try:
+        snapshot = request.app.state.progress_store.get(material_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return progress_payload(snapshot)
+
+
+def _event_result(action) -> dict[str, object]:
+    try:
+        return progress_payload(action())
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except TransitionError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/materials/{material_id}/first-listen/complete")
+def complete_first_listen(material_id: str, request: Request) -> dict[str, object]:
+    return _event_result(lambda: request.app.state.training_events.complete_first_listen(material_id))
+
+
+@router.post("/materials/{material_id}/comprehension-check")
+def submit_comprehension(
+    material_id: str, payload: ComprehensionCheckRequest, request: Request
+) -> dict[str, object]:
+    return _event_result(
+        lambda: request.app.state.training_events.submit_comprehension(
+            material_id=material_id,
+            phase=payload.phase,
+            self_rating=payload.self_rating,
+            summary=payload.summary,
+        )
+    )
+
+
+@router.post("/materials/{material_id}/dictation-parts/{part_no}/complete")
+def complete_dictation_part(material_id: str, part_no: int, request: Request) -> dict[str, object]:
+    return _event_result(
+        lambda: request.app.state.training_events.complete_dictation_part(material_id, part_no)
+    )
+
+
+@router.post("/materials/{material_id}/second-listen/complete")
+def complete_second_listen(material_id: str, request: Request) -> dict[str, object]:
+    return _event_result(lambda: request.app.state.training_events.complete_second_listen(material_id))
+
+
+@router.post("/materials/{material_id}/reading-parts/{part_no}/complete")
+def complete_reading_part(material_id: str, part_no: int, request: Request) -> dict[str, object]:
+    return _event_result(
+        lambda: request.app.state.training_events.complete_reading_part(material_id, part_no)
+    )
+
+
+@router.post("/materials/{material_id}/full-reading-assessment")
+def complete_full_reading_assessment(
+    material_id: str, payload: ReadingAssessmentRequest, request: Request
+) -> dict[str, object]:
+    return _event_result(
+        lambda: request.app.state.training_events.complete_full_reading_assessment(
+            material_id,
+            payload.passed,
+            reference_duration=payload.reference_duration,
+            user_duration=payload.user_duration,
+            speed_result=payload.speed_result,
+            pause_result=payload.pause_result,
+            stress_result=payload.stress_result,
+        )
+    )
+
+
+@router.post("/materials/{material_id}/reading/skip")
+def skip_reading(material_id: str, request: Request) -> dict[str, object]:
+    return _event_result(lambda: request.app.state.training_events.skip_reading(material_id))
+
+
+@router.post("/time-logs/start")
+def start_time_log(payload: TimeLogStartRequest, request: Request) -> dict[str, object]:
+    try:
+        return request.app.state.learning_time.start(**payload.model_dump())
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/time-logs/{time_log_id}/stop")
+def stop_time_log(
+    time_log_id: str, payload: TimeLogStopRequest, request: Request
+) -> dict[str, object]:
+    try:
+        return request.app.state.learning_time.stop(time_log_id, payload.active_seconds)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.get("/stats")
+def get_learning_stats(request: Request) -> dict[str, object]:
+    return request.app.state.learning_time.stats()
+
+
+@router.get("/weekly-assessments")
+def list_weekly_assessments(request: Request) -> list[dict[str, object]]:
+    return request.app.state.weekly_assessments.list()
+
+
+@router.get("/weekly-assessments/{week_id}")
+def get_weekly_assessment(week_id: str, request: Request) -> dict[str, object]:
+    try:
+        return request.app.state.weekly_assessments.get(week_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/weekly-assessments")
+def create_weekly_assessment(
+    payload: WeeklyAssessmentCreateRequest, request: Request
+) -> dict[str, object]:
+    try:
+        return request.app.state.weekly_assessments.create(**payload.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.post("/weekly-assessments/{week_id}/dictation")
+def record_weekly_dictation(
+    week_id: str, payload: WeeklyDictationRequest, request: Request
+) -> dict[str, object]:
+    try:
+        return request.app.state.weekly_assessments.record_dictation(
+            week_id, payload.score, payload.passed
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/weekly-assessments/{week_id}/reading")
+def record_weekly_reading(
+    week_id: str, payload: WeeklyReadingRequest, request: Request
+) -> dict[str, object]:
+    try:
+        return request.app.state.weekly_assessments.record_reading(week_id, payload.dimensions)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/weekly-assessments/{week_id}/evaluate")
+def evaluate_weekly_assessment(week_id: str, request: Request) -> dict[str, object]:
+    try:
+        return request.app.state.weekly_assessments.evaluate(week_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/weekly-assessments/{week_id}/test-items")
+def create_weekly_test_items(
+    week_id: str,
+    request: Request,
+    payload: WeeklyTestItemsRequest | None = None,
+) -> list[dict[str, object]]:
+    count = payload.count if payload is not None else None
+    try:
+        return request.app.state.weekly_assessments.create_test_items(week_id, count)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.get("/weekly-assessments/{week_id}/test-items")
+def list_weekly_test_items(
+    week_id: str, request: Request, kind: str = "TEST"
+) -> list[dict[str, object]]:
+    try:
+        return request.app.state.weekly_assessments.list_test_items(week_id, kind)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/weekly-assessments/{week_id}/test-items/{item_id}/dictation")
+def submit_weekly_test_dictation(
+    week_id: str, item_id: str, payload: WeeklyTestItemDictationRequest, request: Request
+) -> dict[str, object]:
+    try:
+        return request.app.state.weekly_assessments.submit_test_dictation(
+            week_id, item_id, payload.user_text, payload.listen_count
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.post("/weekly-assessments/{week_id}/retest/confirm")
+def confirm_weekly_retest(week_id: str, request: Request) -> dict[str, object]:
+    try:
+        return request.app.state.weekly_assessments.confirm_retest(week_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.post("/weekly-assessments/{week_id}/reinforcement/start")
+def start_weekly_reinforcement(week_id: str, request: Request) -> dict[str, object]:
+    try:
+        return request.app.state.weekly_assessments.start_reinforcement(week_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.post("/weekly-assessments/{week_id}/reinforcement/items/{item_id}/dictation")
+def submit_weekly_reinforcement_dictation(
+    week_id: str, item_id: str, payload: WeeklyTestItemDictationRequest, request: Request
+) -> dict[str, object]:
+    try:
+        return request.app.state.weekly_assessments.submit_reinforcement_dictation(
+            week_id, item_id, payload.user_text, payload.listen_count
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.get("/materials/{material_id}/dictation-context")
+def get_dictation_context(material_id: str, request: Request) -> dict[str, object]:
+    try:
+        return request.app.state.dictation_service.get_context(material_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except TransitionError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.post("/materials/{material_id}/reading-parts/{part_no}/score")
+def score_reading_part(
+    material_id: str, part_no: int, payload: RecordingScoreRequest, request: Request
+) -> dict[str, object]:
+    try:
+        recording_path = request.app.state.reading_service.save_recording(
+            payload.filename, payload.content_base64
+        )
+        return request.app.state.reading_service.score(
+            material_id=material_id,
+            scope="PART",
+            part_no=part_no,
+            recording_path=recording_path,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except TransitionError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/materials/{material_id}/full-reading/score")
+def score_full_reading(
+    material_id: str, payload: RecordingScoreRequest, request: Request
+) -> dict[str, object]:
+    try:
+        recording_path = request.app.state.reading_service.save_recording(
+            payload.filename, payload.content_base64
+        )
+        return request.app.state.reading_service.score(
+            material_id=material_id,
+            scope="FULL",
+            part_no=None,
+            recording_path=recording_path,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except TransitionError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/materials/{material_id}/sentences/{sentence_id}/dictation")
+def submit_dictation(
+    material_id: str,
+    sentence_id: str,
+    payload: DictationSubmitRequest,
+    request: Request,
+) -> dict[str, object]:
+    try:
+        return request.app.state.dictation_service.submit(
+            material_id=material_id,
+            sentence_id=sentence_id,
+            user_text=payload.user_text,
+            listen_count=payload.listen_count,
+            hint_level=payload.hint_level,
+            revealed=payload.revealed,
+            memory_targets=payload.memory_targets,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except TransitionError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
