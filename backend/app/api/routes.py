@@ -94,6 +94,8 @@ def get_material_audio(material_id: str, request: Request) -> FileResponse:
     material = request.app.state.material_store.get(material_id)
     if material is None:
         raise HTTPException(status_code=404, detail=f"No material exists for {material_id}")
+    if material.get("prepare_status", "READY") != "READY":
+        raise HTTPException(status_code=409, detail="Material is not ready for training")
     audio_path = Path(str(material["audio_path"]))
     if not audio_path.is_absolute():
         audio_path = request.app.state.settings.project_root / audio_path

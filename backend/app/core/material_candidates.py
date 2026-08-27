@@ -29,10 +29,21 @@ STAGE_ZONES: dict[str, list[int]] = {
     "STAGE_2": [986, 1689, 955, 959, 979, 987],  # regular-rate programs
     "STAGE_3": [986, 1689, 955, 959, 979, 987],
 }
+#: Speech-rate targets per stage, used for candidate ranking (P1 3.1).
+STAGE_WPM_TARGETS: dict[str, float] = {
+    "STAGE_1": 120.0,
+    "STAGE_2": 150.0,
+    "STAGE_3": 170.0,
+}
 #: Max raw entries scanned per search (5 zones x ~50 latest each). RSS
 #: duration pre-filtering is cheap (no downloads), and 15-20 min slow-English
 #: items sit deep in the feed, so the scan window must cover the whole fetch.
 PROCESS_LIMIT = 250
+#: Bounded retry for provider/quality/transcription failures (P1 8): each
+#: candidate's download, quality check and transcription may be retried this
+#: many times before the entry is rejected.
+RETRY_LIMIT = 2
+RETRY_BACKOFF_SECONDS = 1.0
 #: Candidate validity window (P1 parameter; versioned in config).
 CANDIDATE_TTL_DAYS = 7
 MIN_COVERAGE = 0.80
@@ -95,15 +106,19 @@ class MaterialCandidateService:
 
             article_id = article_url.rstrip("/").split("/")[-1].replace(".html", "")
             try:
-                wav_path = self.provider.download_audio(mp3_url, f"p1-{article_id}", work_dir)
+                wav_path = self._retry(lambda: self.provider.download_audio(mp3_url, f"p1-{article_id}", work_dir))
             except Exception:
                 rejected["download_failed"] = rejected.get("download_failed", 0) + 1
                 continue
 
             quality = self.quality.analyze(str(wav_path))
             if quality.failure_code:
-                rejected["quality_failed"] = rejected.get("quality_failed", 0) + 1
-                continue
+                # Quality check itself failed (unreadable audio): bounded retry.
+                try:
+                    quality = self._retry(lambda: self.quality.analyze(str(wav_path)))
+                except Exception:
+                    rejected["quality_failed"] = rejected.get("quality_failed", 0) + 1
+                    continue
             if quality.level == "Poor":
                 rejected["quality_poor"] = rejected.get("quality_poor", 0) + 1
                 continue
@@ -113,7 +128,7 @@ class MaterialCandidateService:
                 continue
 
             try:
-                segments = self.asr.transcribe(str(wav_path))
+                segments = self._retry(lambda: self.asr.transcribe(str(wav_path)))
             except Exception:
                 rejected["transcribe_failed"] = rejected.get("transcribe_failed", 0) + 1
                 continue
@@ -169,7 +184,8 @@ class MaterialCandidateService:
             if len(candidates) >= max_results:
                 break
 
-        candidates = self._rank(candidates, target_duration_min, target_duration_max)
+        candidates = self._rank(candidates, target_duration_min, target_duration_max, speed_stage)
+        self._write_search_audit(batch_id, scope_id, speed_stage, candidates, rejected, now)
         return {
             "search_batch_id": batch_id,
             "scope_id": scope_id,
@@ -178,18 +194,64 @@ class MaterialCandidateService:
             "rejection_summary": rejected,
         }
 
-    def _rank(self, candidates: list[dict[str, object]], duration_min: float, duration_max: float) -> list[dict[str, object]]:
-        # Clear first, then duration closeness to the band middle, then wpm.
+    def _write_search_audit(
+        self,
+        batch_id: str,
+        scope_id: str,
+        speed_stage: str,
+        candidates: list[dict[str, object]],
+        rejected: dict[str, int],
+        now: datetime,
+    ) -> None:
+        """Persist the search evidence (P1 9): batch, versions, outcome and
+        rejection reasons, so filtering decisions are auditable later."""
+        import json
+
+        with self.database.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO search_audits(
+                    batch_id, scope_id, speed_stage, provider, analyzer_version,
+                    threshold_config_version, candidate_count, rejection_summary_json, created_at
+                ) VALUES (?, ?, ?, 'VOA', ?, ?, ?, ?, ?)
+                """,
+                (
+                    batch_id, scope_id, speed_stage,
+                    ANALYZER_VERSION, THRESHOLD_CONFIG_VERSION,
+                    len(candidates), json.dumps(rejected, sort_keys=True), now.isoformat(),
+                ),
+            )
+
+    def _retry(self, operation: Callable[[], object]) -> object:
+        """Bounded retry with linear backoff; raises after RETRY_LIMIT tries."""
+        import time as _time
+
+        last_error: Exception | None = None
+        for attempt in range(RETRY_LIMIT + 1):
+            try:
+                return operation()
+            except Exception as exc:  # provider/quality/transcription failures
+                last_error = exc
+                if attempt < RETRY_LIMIT:
+                    _time.sleep(RETRY_BACKOFF_SECONDS * (attempt + 1))
+        raise last_error  # type: ignore[misc]
+
+    def _rank(self, candidates: list[dict[str, object]], duration_min: float, duration_max: float, speed_stage: str) -> list[dict[str, object]]:
+        # Ordering per P1 3.1: quality, transcript completeness, duration
+        # closeness to the band middle, then speech-rate closeness to the
+        # stage target. Clear pool first; Acceptable tops up only when the
+        # Clear pool is below three.
         mid = (duration_min + duration_max) / 2.0
+        stage_target_wpm = STAGE_WPM_TARGETS.get(speed_stage, 120.0)
         ordered = sorted(
             candidates,
             key=lambda c: (
                 0 if c["audio_quality"] == "Clear" else 1,
+                0 if c.get("transcript_status") == "COMPLETE" else 1,
                 abs(float(c["duration_seconds"]) - mid * 60),
-                abs(float(c.get("speech_rate_wpm") or 0) - 120),
+                abs(float(c.get("speech_rate_wpm") or 0) - stage_target_wpm),
             ),
         )
-        # Clear pool first; top up with Acceptable only when Clear < 3.
         clears = [c for c in ordered if c["audio_quality"] == "Clear"]
         acceptable = [c for c in ordered if c["audio_quality"] == "Acceptable"]
         return (clears + acceptable)[:3]

@@ -44,10 +44,19 @@ class TrainingProgressStore:
     def get(self, material_id: str) -> ProgressSnapshot:
         with self.database.connect() as connection:
             row = connection.execute(
-                "SELECT * FROM training_progress WHERE material_id = ?", (material_id,)
+                """
+                SELECT p.*, m.prepare_status
+                  FROM training_progress p
+                  JOIN materials m ON m.material_id = p.material_id
+                 WHERE p.material_id = ?
+                """,
+                (material_id,),
             ).fetchone()
         if row is None:
             raise KeyError(f"No progress exists for material {material_id}")
+        # P1 gate: only READY materials are usable by the training core.
+        if row["prepare_status"] != "READY":
+            raise TransitionError("Material is not ready for training")
         return ProgressSnapshot(
             material_id=row["material_id"],
             current_state=MaterialState(row["current_state"]),

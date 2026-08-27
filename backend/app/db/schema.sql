@@ -226,6 +226,18 @@ CREATE TABLE IF NOT EXISTS upgrade_prompts (
     resolved_at TEXT
 );
 
+CREATE TABLE IF NOT EXISTS search_audits (
+    batch_id TEXT PRIMARY KEY,
+    scope_id TEXT NOT NULL DEFAULT 'default',
+    speed_stage TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    analyzer_version TEXT NOT NULL,
+    threshold_config_version TEXT NOT NULL,
+    candidate_count INTEGER NOT NULL DEFAULT 0,
+    rejection_summary_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_candidates_batch ON material_candidates(search_batch_id, candidate_status);
 CREATE INDEX IF NOT EXISTS idx_gate_records_week ON weekly_gate_records(scope_id, created_at);
 

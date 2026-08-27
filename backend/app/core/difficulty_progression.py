@@ -11,6 +11,7 @@ anything else resets it, and a gap between week records resets it too.
 from __future__ import annotations
 
 import json
+import sqlite3
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
@@ -20,13 +21,16 @@ from app.db.connection import Database
 STAGES = ["STAGE_1", "STAGE_2", "STAGE_3"]
 STABLE_WEEKS_REQUIRED = 8
 COOLDOWN_DAYS = 28  # 4 training weeks
-#: Max gap between consecutive week records for the sequence to stay intact.
-WEEK_GAP_TOLERANCE_DAYS = 10
 
 GATE_PASS = "PASS"
 GATE_FAIL = "FAIL"
 GATE_REINFORCEMENT = "REINFORCEMENT_REQUIRED"
 GATE_INCOMPLETE = "INCOMPLETE"
+
+
+def _absolute_week_index(value: datetime) -> int:
+    """Calendar-week ordinal used for week-sequence continuity checks."""
+    return (value.date() - datetime(1970, 1, 1, tzinfo=UTC).date()).days // 7
 
 
 class DifficultyError(ValueError):
@@ -92,7 +96,14 @@ class DifficultyProgressionService:
     # ---------- weekly gate ----------
 
     def evaluate_weekly_gate(self, scope_id: str, training_week_id: str) -> dict[str, object]:
-        """Read the P0 weekly assessment and record an idempotent gate row."""
+        """Read the P0 weekly assessment and record an idempotent gate row.
+
+        Idempotency invariant (P1 8): a repeated evaluation of the same
+        training week at the same stage returns the existing record — and
+        always recomputes the streak, so a lost response followed by a retry
+        can never leave the profile inconsistent with the records. A racing
+        duplicate insert (UNIQUE violation) resolves to the existing row too.
+        """
         with self.database.connect() as connection:
             existing = connection.execute(
                 """
@@ -103,27 +114,45 @@ class DifficultyProgressionService:
                 """,
                 (scope_id, training_week_id, scope_id),
             ).fetchone()
-            if existing is not None:
-                return {"record": dict(existing), "reused": True}
+        if existing is not None:
+            # Always recompute so a lost-response retry can never leave the
+            # profile inconsistent with the records.
+            self._recompute_consecutive(scope_id)
+            return {"record": dict(existing), "reused": True}
 
         assessment = self.weekly_assessments.get(training_week_id)
         stage = self.get_profile(scope_id)["current_stage"]
         result, score, read_score, read_attempted, reasons = self._map_assessment(assessment)
 
-        with self.database.connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO weekly_gate_records(
-                    gate_id, scope_id, training_week_id, stage_at_evaluation, gate_result,
-                    dictation_score, read_aloud_score, read_aloud_attempted,
-                    evaluation_reason_codes, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    str(uuid4()), scope_id, training_week_id, stage, result, score,
-                    read_score, int(read_attempted), json.dumps(reasons), self.now_fn().isoformat(),
-                ),
-            )
+        try:
+            with self.database.connect() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO weekly_gate_records(
+                        gate_id, scope_id, training_week_id, stage_at_evaluation, gate_result,
+                        dictation_score, read_aloud_score, read_aloud_attempted,
+                        evaluation_reason_codes, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(uuid4()), scope_id, training_week_id, stage, result, score,
+                        read_score, int(read_attempted), json.dumps(reasons), self.now_fn().isoformat(),
+                    ),
+                )
+        except sqlite3.IntegrityError:
+            # A concurrent evaluation of the same week+stage already landed;
+            # resolve to the existing row instead of failing.
+            with self.database.connect() as connection:
+                existing = connection.execute(
+                    """
+                    SELECT * FROM weekly_gate_records
+                     WHERE scope_id = ? AND training_week_id = ? AND stage_at_evaluation = ?
+                    """,
+                    (scope_id, training_week_id, stage),
+                ).fetchone()
+            self._recompute_consecutive(scope_id)
+            return {"record": dict(existing), "reused": True}
+
         self._recompute_consecutive(scope_id)
         return {"record": self._latest_record(scope_id), "reused": False}
 
@@ -164,15 +193,26 @@ class DifficultyProgressionService:
         return dict(row) if row else None
 
     def _recompute_consecutive(self, scope_id: str) -> None:
+        """Recompute the streak from the records of the CURRENT stage only.
+
+        Invariants (P1 3.4/3.5):
+        - cross-stage records never contribute (an upgrade resets the count);
+        - a missing week (a gap of more than one calendar week between
+          records) breaks the sequence and resets the count;
+        - a non-passing week resets the count.
+        """
+        stage = self.get_profile(scope_id)["current_stage"]
         with self.database.connect() as connection:
             rows = connection.execute(
-                "SELECT * FROM weekly_gate_records WHERE scope_id = ? ORDER BY created_at ASC, rowid ASC",
-                (scope_id,),
+                "SELECT * FROM weekly_gate_records WHERE scope_id = ? AND stage_at_evaluation = ? ORDER BY created_at ASC, rowid ASC",
+                (scope_id, stage),
             ).fetchall()
         consecutive = 0
-        previous_time: datetime | None = None
+        previous_week_index: int | None = None
         for row in rows:
-            if previous_time is not None and (datetime.fromisoformat(row["created_at"]) - previous_time).days > WEEK_GAP_TOLERANCE_DAYS:
+            week_index = _absolute_week_index(datetime.fromisoformat(row["created_at"]))
+            if previous_week_index is not None and week_index - previous_week_index > 1:
+                # A calendar week with no record breaks the sequence.
                 consecutive = 0
             passes = (
                 row["gate_result"] == GATE_PASS
@@ -180,7 +220,7 @@ class DifficultyProgressionService:
                 and (not row["read_aloud_attempted"] or row["read_aloud_score"] == "PASS")
             )
             consecutive = consecutive + 1 if passes else 0
-            previous_time = datetime.fromisoformat(row["created_at"])
+            previous_week_index = week_index
         profile = self.get_profile(scope_id)
         eligible = (
             consecutive >= STABLE_WEEKS_REQUIRED

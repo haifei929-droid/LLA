@@ -22,10 +22,18 @@ class DictationService:
         """
         with self.database.connect() as connection:
             progress = connection.execute(
-                "SELECT * FROM training_progress WHERE material_id = ?", (material_id,)
+                """
+                SELECT p.*, m.prepare_status
+                  FROM training_progress p
+                  JOIN materials m ON m.material_id = p.material_id
+                 WHERE p.material_id = ?
+                """,
+                (material_id,),
             ).fetchone()
             if progress is None:
                 raise KeyError(f"No progress exists for material {material_id}")
+            if progress["prepare_status"] != "READY":
+                raise TransitionError("Material is not ready for training")
             current_state = progress["current_state"]
             if current_state not in {"DICTATION_PART_1", "DICTATION_PART_2", "DICTATION_PART_3"}:
                 raise TransitionError("Dictation context is only available while a dictation Part is unlocked")
@@ -75,6 +83,11 @@ class DictationService:
             ).fetchone()
             if sentence is None:
                 raise KeyError("Sentence does not belong to material")
+            ready = connection.execute(
+                "SELECT prepare_status FROM materials WHERE material_id = ?", (material_id,)
+            ).fetchone()
+            if ready is None or ready["prepare_status"] != "READY":
+                raise ValueError("Material is not ready for training")
             progress = connection.execute(
                 "SELECT * FROM training_progress WHERE material_id = ?", (material_id,)
             ).fetchone()
