@@ -237,7 +237,11 @@ class WeeklyAssessmentService:
                 if error.get("expected") and error.get("error_type") != "SPELLING":
                     weak_targets.add(error["expected"].lower())
         for row in memory:
-            if datetime.fromisoformat(row["last_seen_at"]) >= window_start and (
+            # last_seen_at may be a naive SQLite timestamp; compare in UTC.
+            last_seen = datetime.fromisoformat(row["last_seen_at"])
+            if last_seen.tzinfo is None:
+                last_seen = last_seen.replace(tzinfo=UTC)
+            if last_seen >= window_start and (
                 (row["avg_attempt_before_correct"] or 0) >= 3 or (row["reveal_count"] or 0) > 0
             ):
                 weak_targets.add(row["target"].lower())
