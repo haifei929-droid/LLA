@@ -70,6 +70,20 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title=settings.app_name, version="0.2.0", lifespan=lifespan)
 app.include_router(router)
 
+
+@app.middleware("http")
+async def no_cache_html(request, call_next):
+    """Never cache the HTML shell so a plain refresh picks up new builds.
+
+    Hashed assets (index-*.css/js) keep their long cacheability; only the
+    shell must revalidate because its asset references change per build.
+    """
+    response = await call_next(request)
+    if request.url.path in ("/",) or request.url.path.endswith(".html"):
+        response.headers["Cache-Control"] = "no-cache"
+    return response
+
+
 # Serve the built frontend from the same process (no file watcher, immune to
 # the Vite dev-server crash on Windows). API routes take precedence; the
 # static mount is the fallback for everything else.
