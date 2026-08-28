@@ -62,11 +62,27 @@ function App() {
   const [dictationContext, setDictationContext] = useState(null)
   const [firstListenPlayed, setFirstListenPlayed] = useState(false)
   const [loading, setLoading] = useState(true)
+  const [homeError, setHomeError] = useState('')
 
-  const refresh = () => fetch('/api/materials')
-    .then((response) => response.json())
-    .then((payload) => { setMaterials(payload); setLoading(false) })
-    .catch(() => setLoading(false))
+  const refresh = () => {
+    setLoading(true)
+    setHomeError('')
+    return fetch('/api/materials')
+      .then((response) => {
+        if (!response.ok) throw new Error('materials')
+        return response.json()
+      })
+      .then((payload) => {
+        setMaterials(payload)
+        setLoading(false)
+        return payload
+      })
+      .catch((error) => {
+        setLoading(false)
+        setHomeError('当前训练暂时无法加载，请检查连接后重试。')
+        throw error
+      })
+  }
 
   useEffect(() => {
     fetch('/api/health')
@@ -75,7 +91,11 @@ function App() {
         setHealth(healthPayload.status === 'ok' ? '训练核心已就绪' : '训练核心异常')
         return refresh()
       })
-      .catch(() => setHealth('后端尚未启动'))
+      .catch(() => {
+        setHealth('后端尚未启动')
+        setLoading(false)
+        setHomeError('当前训练暂时无法加载，请检查连接后重试。')
+      })
   }, [])
 
   // 当前训练素材：优先最近一个进行中的素材，否则最近一篇（可能已完成）。
@@ -121,7 +141,11 @@ function App() {
         setHealth(payload.status === 'ok' ? '训练核心已就绪' : '训练核心异常')
         return refresh()
       })
-      .catch(() => { setHealth('后端尚未启动'); setLoading(false) })
+      .catch(() => {
+        setHealth('后端尚未启动')
+        setLoading(false)
+        setHomeError('当前训练暂时无法加载，请检查连接后重试。')
+      })
   }
 
   const refreshDictationContext = () => {
@@ -153,7 +177,7 @@ function App() {
       })
       .then((progress) => {
         setSelected((current) => current ? { ...current, ...progress } : current)
-        refresh()
+        refresh().catch(() => {})
         setMessage('状态已更新。')
       })
       .catch((error) => setMessage(error.message))
@@ -186,7 +210,7 @@ function App() {
         setForm(blankMaterial)
         setShowImport(false)
         setMessage('素材已导入，可以进入训练。')
-        refresh().then(() => openMaterial(payload.material_id))
+        refresh().then(() => openMaterial(payload.material_id)).catch(() => {})
       })
       .catch((error) => setMessage(error.message))
   }
@@ -337,7 +361,7 @@ function App() {
         <div className="brand">LLA</div>
         <nav className="sidebar-nav">
           {navItems.map((item) => (
-            <button key={item.key} className={view === item.key ? 'active' : ''} onClick={() => setView(item.key)}>{item.label}</button>
+            <button key={item.key} className={view === item.key ? 'active' : ''} aria-current={view === item.key ? 'page' : undefined} onClick={() => setView(item.key)}>{item.label}</button>
           ))}
         </nav>
       </aside>
@@ -353,13 +377,20 @@ function App() {
 
         {view === 'home' && <>
           {health === '后端尚未启动' && <div className="notice error">后端尚未启动，无法加载训练数据。<button className="link-btn" onClick={retry}>重试</button></div>}
-          <section className="home-section accent-training">
+          <section className="home-section accent-training" aria-busy={loading}>
             <p className="section-label">当前训练</p>
             {loading ? (
-              <div className="training-hero skeleton-block">
+              <div className="training-hero skeleton-block" role="status" aria-label="正在加载当前训练">
                 <div className="sk-line sk-short"></div>
                 <div className="sk-line sk-wide"></div>
                 <div className="sk-line"></div>
+              </div>
+            ) : homeError ? (
+              <div className="training-hero error-hero" role="alert">
+                <div className="hero-meta"><span className="hero-state">加载失败</span></div>
+                <h2>当前训练暂时不可用</h2>
+                <p className="hero-context">{homeError}</p>
+                <button className="primary" onClick={retry}>重试</button>
               </div>
             ) : currentMaterial ? (
               <div className="training-hero">
