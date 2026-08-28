@@ -130,7 +130,7 @@ Evaluate in order; the first matching rule wins. `R0` means "no recommendation" 
 | R7 | 空库 / 全完成 | No materials at all | `导入素材` (view `materials`) |
 | R0 | — | All materials fully completed and weekly gate passed | none — render the default band text |
 
-A material in `READY_FIRST_LISTEN`, `FIRST_COMPREHENSION_CHECK`, or `READING_AVAILABLE` is "in progress" for ranking; between R2–R5, choose by the ladder above (a `READY_FIRST_LISTEN`/`FIRST_COMPREHENSION_CHECK` material is the fallback resume target when no DICTATION/SECOND/READING state exists — the CTA becomes `继续盲听/理解检查`).
+A material in `READY_FIRST_LISTEN`, `FIRST_COMPREHENSION_CHECK`, or `READING_AVAILABLE` is "in progress" for ranking; between R2–R5, choose by the ladder above (a `READY_FIRST_LISTEN`/`FIRST_COMPREHENSION_CHECK` material is the fallback resume target when no DICTATION/SECOND/READING state exists — the CTA becomes `继续盲听/理解检查`). The fallback returns `priority: "R_CONTINUE"` with CTA `继续训练`.
 
 ### 5.2 Recommendation contract (backend authority)
 
@@ -144,7 +144,7 @@ Response (single object, 200):
 
 | Field | Type | Meaning |
 |---|---|---|
-| `priority` | `"R1"…"R7"` or `null` (R0) | Matched ladder rule |
+| `priority` | `"R1"…"R7"`, `"R_CONTINUE"`, or `null` (R0) | Matched ladder rule |
 | `title` | string | One-line recommendation title (CN) |
 | `detail` | string | One-line supporting fact (material title, part number, gate score) |
 | `cta` | string | Button label (CN) |
@@ -159,7 +159,7 @@ Deterministic, read-only, no side effects. Implemented in a new `HomeRecommendat
 
 | Need | Source |
 |---|---|
-| Material list + states | `GET /api/materials` (rows: `material_id`, `title`, `current_state`, `duration_seconds`, `source_name`, `dictation_part_status`, `reading_part_status`) |
+| Material list + states | `GET /api/materials` (rows: `material_id`, `title`, `current_state`, `duration_seconds`, `speech_rate_wpm`, `status`); the recommendation service reads `dictation_part_status` / `reading_part_status` / `prepare_status` directly from `training_progress`/`materials` through the database |
 | Material detail | `GET /api/materials/{id}` |
 | Cumulative + weekly seconds | `GET /api/stats` (`total_learning_seconds`, `weekly_learning_seconds`) |
 | Weekly Gate state | `GET /api/weekly-assessments` (latest `week_id`, gate result, `state`) |

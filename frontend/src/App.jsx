@@ -27,6 +27,35 @@ function App() {
   const [comprehension, setComprehension] = useState({ rating: '30–50%', summary: '' })
   const [dictationContext, setDictationContext] = useState(null)
   const [firstListenPlayed, setFirstListenPlayed] = useState(false)
+  const [recommendation, setRecommendation] = useState(null)
+  const [weeklyLabel, setWeeklyLabel] = useState('未创建')
+  const [weeklyDetail, setWeeklyDetail] = useState('创建本周周测以推进 Gate')
+
+  const loadHome = () => {
+    fetch('/api/home/recommendation')
+      .then((response) => response.json())
+      .then(setRecommendation)
+      .catch(() => setRecommendation(null))
+    fetch('/api/weekly-assessments')
+      .then((response) => response.json())
+      .then((assessments) => {
+        const latest = assessments[0]
+        if (!latest) {
+          setWeeklyLabel('未创建')
+          setWeeklyDetail('创建本周周测以推进 Gate')
+        } else if (latest.gate_status === 'WEEKLY_GATE_PASS') {
+          setWeeklyLabel('已通过')
+          setWeeklyDetail('本周 Gate 已通过，可继续训练')
+        } else if (['REINFORCEMENT_REQUIRED', 'REINFORCEMENT', 'TARGETED_RETEST'].includes(latest.gate_status)) {
+          setWeeklyLabel('未通过')
+          setWeeklyDetail('需要强化训练后复测')
+        } else {
+          setWeeklyLabel('进行中')
+          setWeeklyDetail('本周周测尚未完成')
+        }
+      })
+      .catch(() => setWeeklyLabel('未创建'))
+  }
 
   const refresh = () => Promise.all([
     fetch('/api/materials').then((response) => response.json()),
@@ -42,6 +71,7 @@ function App() {
     ])
       .then(([healthPayload]) => {
         setHealth(healthPayload.status === 'ok' ? '训练核心已就绪' : '训练核心异常')
+        loadHome()
         return refresh()
       })
       .catch(() => setHealth('后端尚未启动'))
@@ -55,6 +85,13 @@ function App() {
       .then((response) => response.json())
       .then(setMaterials)
       .catch(() => setMessage('素材搜索失败，请确认后端已启动。'))
+  }
+
+  const goRecommendation = () => {
+    if (!recommendation) return
+    const target = recommendation.target_view
+    if (target === 'training' && recommendation.material_id) openMaterial(recommendation.material_id)
+    else if (target) setView(target)
   }
 
   const openMaterial = (materialId) => {
@@ -289,10 +326,22 @@ function App() {
         <p>训练状态、素材进度和学习时长由 Training Core 与 SQLite 保存，下一次打开仍能从上次的位置继续。</p>
       </section>
 
+      {recommendation && recommendation.priority && (
+        <section className={`recommendation${recommendation.tone === 'danger' ? ' tone-danger' : ''}`}>
+          <div className="recommendation-copy">
+            <p className="eyebrow">下一步</p>
+            <h3>{recommendation.title}</h3>
+            <p>{recommendation.detail}</p>
+          </div>
+          <button className="primary" onClick={goRecommendation}>{recommendation.cta}</button>
+        </section>
+      )}
+
       <section className="grid">
         <button className="card metric action-card" onClick={() => setView('materials')}><span>声音训练素材</span><strong>{materials.length}</strong><p>点击进入素材搜索与训练</p></button>
         <article className="card metric"><span>累计学习</span><strong>{totalMinutes}<small> 分钟</small></strong><p>由活动日志自动汇总</p></article>
-        <button className="card metric action-card" onClick={() => setView('weekly')}><span>周测 Gate</span><strong>周测</strong><p>听写与朗读 gate：决定是否推荐下一轮</p></button>
+        <article className="card metric"><span>本周学习</span><strong>{stats ? Math.floor((stats.weekly_learning_seconds || 0) / 60) : 0}<small> 分钟</small></strong><p>本周有效训练时长</p></article>
+        <button className="card metric action-card" onClick={() => setView('weekly')}><span>周测 Gate</span><strong>{weeklyLabel}</strong><p>{weeklyDetail}</p></button>
         <button className="card metric action-card" onClick={() => setView('candidates')}><span>候选素材 · P1</span><strong>候选</strong><p>搜索音质清晰的 15–20 分钟候选，确认后创建正式素材</p></button>
         <button className="card metric action-card" onClick={() => setView('p2')}><span>长期仪表盘 · P2</span><strong>仪表盘</strong><p>时长 / 首次理解 / 记忆深化 / 难度历史</p></button>
       </section>

@@ -381,6 +381,12 @@ def stop_time_log(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
+@router.get("/home/recommendation")
+def home_recommendation(request: Request) -> dict[str, object]:
+    """Read-only homepage recommendation ladder (Spec 26.2)."""
+    return request.app.state.home_recommendation.read()
+
+
 @router.get("/stats")
 def get_learning_stats(request: Request) -> dict[str, object]:
     return request.app.state.learning_time.stats()

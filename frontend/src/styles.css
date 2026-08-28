@@ -31,6 +31,15 @@ h1 { margin-bottom: 0; font-size: clamp(28px, 5vw, 48px); font-weight: 800; lett
 .metric strong { display: block; margin-top: 26px; color: #17202a; font-size: 38px; font-weight: 800; letter-spacing: -.06em; font-variant-numeric: tabular-nums; }
 .metric small { color: #6b7785; font-size: 15px; letter-spacing: 0; }
 .materials { margin-top: 22px; padding: 28px; border-radius: 18px; background: #17202a; color: #fff; }
+.recommendation { display: flex; align-items: center; justify-content: space-between; gap: 24px; margin-top: 40px; padding: 26px 30px; border-radius: 18px; background: #17202a; color: #fff; }
+.recommendation-copy { min-width: 0; }
+.recommendation .eyebrow { color: #aab6c2; }
+.recommendation h3 { margin: 0 0 6px; font-size: 24px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.recommendation p:last-child { margin: 0; color: #aab6c2; font-size: 13px; }
+.recommendation .primary { flex-shrink: 0; background: #8ee1b0; color: #173c29; }
+.recommendation.tone-danger { background: #f2c6c6; color: #7c2020; }
+.recommendation.tone-danger .eyebrow, .recommendation.tone-danger p:last-child { color: #8a4a4a; }
+.recommendation.tone-danger .primary { background: #7c2020; color: #fff; }
 .section-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; }
 .section-heading h3 { margin: 0; font-size: 26px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .section-heading > span { color: #aab6c2; font-size: 13px; }

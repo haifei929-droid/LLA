@@ -21,6 +21,7 @@ from app.core.weekly import WeeklyAssessmentService
 from app.core.difficulty_progression import DifficultyProgressionService
 from app.core.difficulty_history import DifficultyHistoryService
 from app.core.dashboard import DashboardService
+from app.core.home_recommendation import HomeRecommendationService
 from app.core.memory_deepening import MemoryDeepeningService
 from app.adapters.voa_material import VOALearningEnglishProvider
 from app.adapters.web_material import BBCLearningEnglishProvider
@@ -62,6 +63,7 @@ async def lifespan(app: FastAPI):
     app.state.material_search.history = app.state.difficulty_history
     app.state.dashboard = DashboardService(database)
     app.state.memory = MemoryDeepeningService(database)
+    app.state.home_recommendation = HomeRecommendationService(database)
     yield
 
 
