@@ -1,257 +1,254 @@
-# LLA Homepage UI V1 Development Specification
+# LLA Homepage UI V1 Development Spec
 
-- **Version:** V1.0
-- **Date:** 2026-08-28
-- **Audience:** frontend/backend development and acceptance
-- **Scope:** Homepage (首页) UI V1 — information architecture, visual tokens, home recommendation, component specification, and acceptance criteria
-- **Design source:** P0 Development Spec V1.0 §26 (UI 信息架构与全局设计原则) and §26.2 (首页推荐优先级), frozen; `docs/development-flow.md` §2; `docs/acceptance-checklist.md` §0/§1/§5
-- **Dependencies:** P0 Training Core + existing API contracts (`/api/materials`, `/api/materials/{id}/progress`, `/api/stats`, `/api/weekly-assessments`, `/api/health`), P1/P2 module entry points
-- **Non-regression rule:** This specification does not authorize changes to P0/P1/P2 behavior, state transitions, scoring rules, or existing endpoints. It may add read-only endpoints only. No transcript content may be exposed during blind listening or dictation states.
+## 1. 文档目的
 
-## 1. Product objective
+本文档用于指导 DSH 实现 LLA 首页 UI V1。它只约束首页的信息架构、视觉层级、组件表现和响应式布局，不改变现有业务逻辑、数据模型、接口契约或训练流程。
 
-The homepage is the single entry point of the Training Workspace. Within three seconds of opening it, the user must be able to answer three questions (Spec 31.9 / §26):
+## 2. 已确认的 V1 基线
 
-1. **我在哪** — which workspace this is and whether the training core is ready.
-2. **结果怎么样** — accumulated learning hours, this week's status, and material progress at a glance.
-3. **下一步做什么** — one clear, prioritized next action (Spec 26.2), executable with one click.
+- 首页只聚焦三类信息：当前训练、当前素材/新素材、训练方式。
+- 当前训练是首页的视觉中心和首要行动入口。
+- 顶部主标题弱化，不与当前训练争夺注意力。
+- 移除右上角 Quote；不保留无功能价值的占位区域。
+- 左侧导航收窄，保持必要识别与导航能力即可。
+- 使用同一冷色体系中的三种低饱和主色：蓝灰、青灰、紫灰；三色明度接近。
+- 当前训练、素材、训练方式按功能分区组织，不做混合信息流。
+- 训练方式卡片轻量化：减少边框和按钮重量，降低装饰性。
+- 整体采用冷灰底、大留白、大卡片、简单图形，优先保证信息清晰。
+- 不增加游戏化、教育 App 式装饰、积分徽章、连续签到、排行榜、夸张插画或无业务价值的动效。
 
-The homepage is a personal language-training instrument panel, not a course or gamified app (Spec 26): color blocks, basic shapes, numbers, and status symbols carry the information; decoration, animation, icons, illustrations, coins, stars, and streak flames are excluded.
+## 3. 页面结构
 
-## 2. Goals and non-goals
+```text
+App Shell
+├── Narrow Sidebar
+│   ├── Brand / Product Mark
+│   ├── Primary Navigation
+│   └── Optional User / Settings Entry
+└── Main Content
+    ├── Top Bar
+    │   └── Weak Page Title / Context Label
+    ├── Current Training Section  ← visual center
+    │   ├── Section Label
+    │   └── Current Training Hero Card
+    │       ├── Training Name / Context
+    │       ├── Progress or State Summary
+    │       ├── Minimal Supporting Metadata
+    │       └── Primary Continue / Start Action
+    ├── Current Material / New Material Section
+    │   ├── Section Label
+    │   └── Material Card(s)
+    │       ├── Current Material
+    │       └── New Material Entry / Preview
+    └── Training Modes Section
+        ├── Section Label
+        └── Lightweight Training Mode Card(s)
+            ├── Mode Name
+            ├── One-line Description
+            └── Low-weight Action / Select State
+```
 
-### 2.1 Goals
+### 3.1 结构要求
 
-- Present the three questions above with zero scrolling on a desktop viewport.
-- Render the Spec 26.2 recommendation ladder as a single highlighted action card, with priority order enforced deterministically.
-- Show weekly status (this week's learning seconds, Weekly Gate outcome if one exists) next to cumulative hours.
-- Keep module navigation one click away for Materials, Weekly Test, Candidates (P1), and Dashboard (P2).
-- Formalize the visual tokens (typography, module tints, status colors) introduced by the UI beautification pass so every page uses the same language.
-- Keep every page title on one line (no wrapping) at all supported widths.
-- Keep the existing single-page navigation model (`view` state in `App.jsx`); no router dependency is introduced.
+1. 内容区从上到下遵循“当前训练 → 当前素材/新素材 → 训练方式”的阅读顺序。
+2. 当前训练卡片在面积、位置、色彩对比和行动明确性上最高优先级。
+3. 页面标题只承担上下文识别，不承担视觉主角职责；字号、字重和对比度均低于当前训练标题。
+4. Quote 区域完全移除，包括空容器、占位文案、图标和保留间距。
+5. 训练方式作为选择区域存在，不应被设计成高权重营销卡片或游戏化任务卡。
+6. 若某区无数据，保留该功能分区的稳定结构，使用轻量空状态，不改变其他分区位置逻辑。
 
-### 2.2 Non-goals
+## 4. 组件层级与职责
 
-Homepage UI V1 must not:
+### 4.1 App Shell
 
-- Change the P0 material state machine, dictation/reading rules, or any event endpoint.
-- Auto-start training without a click; the recommendation card is an action, not an auto-runner.
-- Expose transcript or sentence text for materials in blind-listening or dictation states.
-- Add gamification, social, cloud sync, multi-user, themes, dark mode, or an icon library.
-- Move training content into the homepage; the homepage only summarizes and navigates.
-- Add new material or weekly endpoints unless the recommendation contract in §5.3 requires one.
+- 负责全局页面背景、侧栏与主内容区布局。
+- 不在首页新增业务状态，不改变路由、权限或数据加载方式。
 
-## 3. Design foundation (frozen)
+### 4.2 Narrow Sidebar
 
-### 3.1 Visual principles (Spec 26, frozen)
+- 负责品牌识别和主导航。
+- 默认宽度建议 `208px`，允许在实现中于 `192–224px` 范围内微调。
+- 导航项使用简洁图标与短标签；不增加装饰性分组。
+- 当前页使用低饱和填充或细微色条表达，不使用高饱和实心按钮。
 
-1. Visual positioning: personal language training dashboard / Training Workspace.
-2. Elements: color blocks, basic shapes, progress bars, waveforms, numbers, status symbols.
-3. Minimal decoration/animation/icons; no course feel, check-in feel, gamification, or cartoon style.
-4. Every page answers: where am I → what is the result → what is next.
-5. Status color semantics are globally consistent (see §3.3).
-6. Training pages follow: top context → core workspace → feedback blocks → primary action. (Homepage is not a training page; it follows §4 instead.)
+### 4.3 Top Bar / Weak Page Title
 
-### 3.2 Typography tokens
+- 仅保留必要页面上下文、辅助操作或用户入口。
+- 页面主标题建议 20–24px、常规或中等字重。
+- 不使用大号 Hero 标题，不增加 Quote 或替代性名言区域。
 
-| Token | Value | Rule |
+### 4.4 Current Training Hero Card
+
+- 首页唯一视觉中心。
+- 建议使用大卡片容器，内部留白明显，信息层级不超过三层：训练名称、状态/进度、主要行动。
+- 主行动使用一个明确的主按钮或等价交互；不同时放置多个同权重 CTA。
+- 图形仅用于解释状态或进度，不使用游戏化插画、奖章、火焰、星星等装饰。
+
+### 4.5 Material Card
+
+- 展示当前素材与新素材的必要信息。
+- 当前素材强调连续性，新素材强调可发现性，但两者不应超过当前训练的视觉权重。
+- 辅助操作使用文本按钮、图标按钮或低权重按钮。
+
+### 4.6 Training Mode Card
+
+- 展示训练方式名称、简短说明和选择/进入动作。
+- 优先使用无边框或弱边框卡片、分隔线、浅色底或 hover 状态。
+- 减少厚重按钮、描边堆叠、重复阴影和大面积图标。
+- 多个卡片之间保持统一高度或统一内容节奏，避免视觉噪声。
+
+### 4.7 Status / Empty / Error Components
+
+- 状态表现必须在各分区保持同一套颜色、图标和文字规则。
+- 状态信息应服务于理解和行动，不制造紧迫感或游戏反馈感。
+
+## 5. 颜色 Token 建议
+
+以下为 V1 的起始 token 建议。实现时应以实际组件截图和文字对比度检查为准；若品牌色或现有系统已有等价 token，应优先复用并保持本节的关系约束。
+
+### 5.1 基础色
+
+| Token | 建议值 | 用途 |
 |---|---|---|
-| `--font-stack` | `Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans SC", ui-sans-serif, system-ui, sans-serif` | Mixed CN/EN text |
-| Base size | 16px, `line-height: 1.6` | Body text |
-| `h1` (workspace title) | `clamp(28px, 5vw, 48px)`, weight 800, `white-space: nowrap` | Never wraps; ellipsis on overflow |
-| `h2` (hero slogan) | `clamp(34px, 6vw, 66px)`, weight 800, `line-height: .98`, `white-space: nowrap` | May wrap only at ≤600px viewport |
-| Module `h2` (page title) | `clamp(30px, 5vw, 52px)`, weight 800, `white-space: nowrap` | Never wraps; ellipsis on overflow |
-| `h3` / card titles | 22–26px, `white-space: nowrap` | Never wraps; ellipsis on overflow |
-| Numbers | `font-variant-numeric: tabular-nums` | Metrics align vertically |
-| `--eyebrow` | 12px, weight 700, `letter-spacing: .14em` | Section labels |
+| `color.bg.canvas` | `#F4F6F8` | 页面冷灰背景 |
+| `color.bg.surface` | `#FFFFFF` | 卡片和主要内容表面 |
+| `color.bg.subtle` | `#EEF2F4` | 次级区域、轻量 hover 或空状态底 |
+| `color.text.primary` | `#26313A` | 主要标题和关键内容 |
+| `color.text.secondary` | `#64727C` | 描述、元数据、弱化标题 |
+| `color.text.muted` | `#8B979F` | 辅助提示和非重点信息 |
+| `color.border.subtle` | `#E0E6EA` | 弱边框和分隔线 |
+| `color.border.focus` | `#607B8A` | 键盘焦点或明确交互焦点 |
 
-Rule: **titles never wrap**. Where a title is longer than its container (e.g. a material title), the container truncates with an ellipsis; the layout never reflows the heading.
+### 5.2 三个主色
 
-### 3.3 Status color semantics (global, unchanged)
+三色属于同一冷色语境，建议保持相近明度和低饱和度；它们用于分区识别与轻量状态提示，不用于制造强烈对立。
 
-| Meaning | Block | Text |
-|---|---|---|
-| Done / pass | `#d9f4e4` | `#17633b` |
-| In progress / active | `#e8edf2` | `#5b6875` |
-| Locked / not started | `#f0f2f4` | `#9aa6b0` |
-| Error / fail | `#f2c6c6` | `#7c2020` |
-| Near pass / close | `#f5e9a8` | `#6b5b12` |
-| Word-form issue | `#d8ccf0` | `#4a2e7c` |
-| Spelling issue | `#f5e9a8` | `#6b5b12` |
-| Blank (admitted unknown) | `#dfe4e8` | `#4d5a66` |
-
-### 3.4 Module background tints (established by the beautification pass, now normative)
-
-| Module (view) | Tint | Border |
-|---|---|---|
-| Home hero | linear-gradient `#e5ecf5 → #f2f6fa → #eef2f6` | `#dbe4ee` |
-| Materials (素材) | `#eaf2fc` | `#d3e2f3` |
-| Weekly (周测 Gate) | `#f1edf9` | `#dfd6f0` |
-| Candidates (候选 P1) | `#e7f4f0` | `#cfe7de` |
-| P2 Dashboard | `#faf4e6` | `#efe3c9` |
-| Training | `#edf7ef` | `#d6eadb` |
-| Dark band (recent materials) | `#17202a` | — |
-
-White content cards (`rgba(255,255,255,.78)` on `#eef1f4` page background, 18px radius, `#dce2e7` border) carry interactive content inside tinted modules.
-
-## 4. Homepage information architecture
-
-Top-to-bottom order on the homepage (desktop, no scrolling for the first three blocks):
-
-1. **TopBar** — eyebrow `LANGUAGE TRAINING AGENT · P0`, `h1` "Training Workspace", health status pill (ok: green `训练核心已就绪`; degraded: red; backend down: `后端尚未启动`).
-2. **Hero** — eyebrow `当前阶段`, slogan `把每一次练习，变成可恢复的进步`, one-line status sentence summarizing state ("训练状态、素材进度和学习时长由 Training Core 与 SQLite 保存，下一次打开仍能从上次的位置继续。").
-3. **Recommendation band** — the single next action from §5, rendered as one highlighted card with CTA. When the recommended action is reinforcement (Weekly Gate failed), the band uses the error-tint (`#f2c6c6`/`#7c2020`) treatment; otherwise it stays on the dark band (`#17202a`) or a `READY`-green accent.
-4. **Stats grid** — three or four number cards: 素材数量 (entry to Materials), 累计学习 (hours, from `/api/stats`), 本周学习 (seconds/minutes, from `weekly_learning_seconds`), 周测 Gate (entry to Weekly; shows `已通过`/`未通过`/`未创建`).
-5. **Module entry cards** — P1 候选素材 and P2 仪表盘 entries (smaller than stats; may share the grid).
-6. **Recent materials** — dark band (`#17202a`), up to 5 rows, in-progress materials ranked before completed ones (same rule as today), each row showing title, id, and current state; row click opens the material training view.
-
-### 4.1 Question mapping
-
-| Question | Block |
-|---|---|
-| 我在哪 | TopBar + Hero |
-| 结果怎么样 | Stats grid + Recent materials |
-| 下一步做什么 | Recommendation band |
-
-## 5. Home recommendation (Spec 26.2, formalized)
-
-### 5.1 Priority ladder
-
-Evaluate in order; the first matching rule wins. `R0` means "no recommendation" (all materials complete and nothing else pending).
-
-| Priority | Rule (26.2) | Condition | CTA |
+| Token | 建议值 | 首选语义 | 使用方式 |
 |---|---|---|---|
-| R1 | 周测未通过 / 强化未完成 | Latest weekly assessment gate is `FAILED` or state is `REINFORCEMENT_REQUIRED` / reinforcement items remain un-exact | `进入强化训练` (view `weekly`) |
-| R2 | 存在未完成听写 | A material is in `DICTATION_PART_*` (resume the exact Part) | `继续听写 Part N` (view `training`) |
-| R3 | 听写完成但复听/理解复测未完成 | Material in `SECOND_FULL_LISTEN` or a pending `SECOND_COMPREHENSION_CHECK` | `继续二次复听` (view `training`) |
-| R4 | 存在已解锁朗读 | Material in `READING_AVAILABLE` | `继续朗读 Part N` (view `training`) |
-| R5 | 三段朗读完成 | Material in `FULL_READING_ASSESSMENT` | `全文朗读验收` (view `training`) |
-| R6 | 当前素材完成 | Material in `LISTENING_COMPLETED` or `FULLY_COMPLETED` (most recently completed first) | `获取下一篇素材` (view `training`, calls `POST /api/materials/next`) |
-| R7 | 空库 / 全完成 | No materials at all | `导入素材` (view `materials`) |
-| R0 | — | All materials fully completed and weekly gate passed | none — render the default band text |
+| `color.accent.blueGray` | `#7F98AA` | 当前训练 | 主卡片细节、进度、选中态的浅色强调 |
+| `color.accent.cyanGray` | `#7FA9A7` | 当前素材/新素材 | 素材区图形、标签或细微强调 |
+| `color.accent.purpleGray` | `#928EAA` | 训练方式 | 方式区图形、标签或细微强调 |
 
-A material in `READY_FIRST_LISTEN`, `FIRST_COMPREHENSION_CHECK`, or `READING_AVAILABLE` is "in progress" for ranking; between R2–R5, choose by the ladder above (a `READY_FIRST_LISTEN`/`FIRST_COMPREHENSION_CHECK` material is the fallback resume target when no DICTATION/SECOND/READING state exists — the CTA becomes `继续盲听/理解检查`). The fallback returns `priority: "R_CONTINUE"` with CTA `继续训练`.
+建议为每个主色提供透明度或浅色表面版本，例如 `accent.*.surface` 使用约 8–14% 的对应色混合到 `color.bg.surface` 中。主色不应大面积高饱和铺满卡片，也不应与红、橙、亮黄等对立色组成装饰性配色。
 
-### 5.2 Recommendation contract (backend authority)
+### 5.3 交互与状态色
 
-New read-only endpoint:
+状态色不作为第四、第五主色体系使用，只在确有语义时出现，并保持低饱和、克制面积。
 
-```
-GET /api/home/recommendation
-```
-
-Response (single object, 200):
-
-| Field | Type | Meaning |
+| Token | 建议值 | 用途 |
 |---|---|---|
-| `priority` | `"R1"…"R7"`, `"R_CONTINUE"`, or `null` (R0) | Matched ladder rule |
-| `title` | string | One-line recommendation title (CN) |
-| `detail` | string | One-line supporting fact (material title, part number, gate score) |
-| `cta` | string | Button label (CN) |
-| `target_view` | `"training" | "weekly" | "materials" | "candidates" | "p2"` | Frontend view to open |
-| `material_id` | string | null | Material to open when `target_view="training"` |
-| `week_id` | string | null | Week to open when `target_view="weekly"` |
-| `tone` | `"danger" | "default"` | `danger` for R1 (reinforcement), otherwise `default` |
+| `color.state.success` | `#6E9A8F` | 完成或成功 |
+| `color.state.warning` | `#A18F68` | 需要注意但非错误 |
+| `color.state.error` | `#A77A7F` | 错误、失败、不可继续 |
+| `color.state.info` | `#718EA1` | 信息提示 |
 
-Deterministic, read-only, no side effects. Implemented in a new `HomeRecommendationService` reading `training_progress`/`materials`/`weekly_assessments` through existing stores. The frontend renders the card from this payload; it must also degrade gracefully (render the default band text) when the endpoint is unavailable or returns `priority: null`.
+错误和警告应优先通过图标、文字和布局表达，不能只依赖颜色。
 
-### 5.3 Data sources (existing contracts, unchanged)
+## 6. 间距、圆角与阴影
 
-| Need | Source |
-|---|---|
-| Material list + states | `GET /api/materials` (rows: `material_id`, `title`, `current_state`, `duration_seconds`, `speech_rate_wpm`, `status`); the recommendation service reads `dictation_part_status` / `reading_part_status` / `prepare_status` directly from `training_progress`/`materials` through the database |
-| Material detail | `GET /api/materials/{id}` |
-| Cumulative + weekly seconds | `GET /api/stats` (`total_learning_seconds`, `weekly_learning_seconds`) |
-| Weekly Gate state | `GET /api/weekly-assessments` (latest `week_id`, gate result, `state`) |
-| Health | `GET /api/health` |
+### 6.1 间距
 
-## 6. Component specification
+- 建议采用 4px 基础网格：`4 / 8 / 12 / 16 / 24 / 32 / 48 / 64px`。
+- 主内容区左右内边距：桌面建议 `48px`，中等窗口建议 `32px`，窄窗口建议 `20px`。
+- 分区之间建议 `40–56px`；同一分区标题与内容之间建议 `12–20px`。
+- 当前训练卡片内部留白建议 `32–48px`；训练方式卡片内部留白建议 `20–24px`。
+- 大留白用于建立主次关系，不应通过额外装饰填满。
 
-### 6.1 TopBar
+### 6.2 圆角
 
-- Left: eyebrow + `h1` (no wrap, ellipsis).
-- Right: health pill (nowrap, `flex-shrink: 0`, tabular nums).
-- ≤720px: stacks vertically (existing rule).
+- 页面大卡片：`20–24px`。
+- 普通卡片：`16–20px`。
+- 按钮、标签和输入控件：`10–12px`。
+- 不使用过度圆润的胶囊化设计作为默认形态；胶囊仅用于短标签或明确状态。
 
-### 6.2 Hero
+### 6.3 阴影
 
-- Tinted gradient block (3.4), 24px radius, `padding: 30px 34px 34px`.
-- Slogan never wraps above 600px; between 601–720px font shrinks via `clamp(24px, 5.8vw, 40px)`.
+- 默认卡片优先使用无阴影或极轻阴影，依靠背景层次、留白和边界建立结构。
+- 建议默认阴影：`0 4px 16px rgba(38, 49, 58, 0.04)`。
+- hover/focus 只允许轻微增强；不使用悬浮、发光、彩色投影等游戏化效果。
+- 训练方式卡片尽量不使用独立阴影，以保持轻量。
 
-### 6.3 Recommendation band
+## 7. 状态样式
 
-- Placed directly under the hero, above the stats grid.
-- `tone=danger`: block `#f2c6c6` / text `#7c2020`, CTA `primary` on error tint.
-- `tone=default`: dark band `#17202a` with green accent CTA (`#8ee1b0`), matching the existing recent-materials band language.
-- Contains: eyebrow `下一步`, title (no wrap), detail (muted, one line), CTA button.
-- Clicking the CTA switches view per `target_view` and opens `material_id`/`week_id` when present.
-
-### 6.4 Stats grid
-
-- Up to 4 cards (`card metric`), each: label, big number (tabular, weight 800), one-line caption.
-- 累计学习 shows hours (`total_learning_seconds / 3600`, floor); 本周学习 shows minutes; 素材数量 shows count and acts as Materials entry; 周测 Gate card shows the latest gate outcome and acts as Weekly entry.
-
-### 6.5 Module entry cards
-
-- P1 候选素材 → `candidates`; P2 仪表盘 → `p2`. Same `card action-card` style as today.
-
-### 6.6 Recent materials (dark band)
-
-- `#17202a` band, `section-heading` (title `最近素材` + sync hint), rows up to 5.
-- Ordering: in-progress (`current_state` not in `FULLY_COMPLETED`/`LISTENING_COMPLETED`) before completed; stable by `material_id` within groups.
-- Row: title (strong, nowrap/ellipsis), `material_id` (muted), state label (green `#8ee1b0`).
-- Empty state: `导入预置素材后，这里会显示当前 Part 和恢复位置。`
-
-### 6.7 Empty and degraded states
-
-| Condition | Rendering |
-|---|---|
-| Backend down | Health pill `后端尚未启动`; API failures surface as `notice` blocks; page never white-screens |
-| No materials | Stats show 0; recent-materials band shows empty text; recommendation R7 |
-| Recommendation endpoint error | Band shows default text `训练核心已就绪，选择下方模块开始` with no CTA |
-
-## 7. Responsive and behavior rules
-
-- ≤720px: stats grid and module entries collapse to one column; module padding `22px 18px 28px`; `h1` 26px; module `h2` 24px.
-- Titles never wrap at any width (see 3.2); overflow truncates with ellipsis.
-- Page refresh restores the exact training position (existing behavior — recommendation and progress must agree with `/api/materials`).
-- No auto-play, no auto-navigation, no polling loops on the homepage (single fetch per endpoint on mount).
-
-## 8. Acceptance criteria
-
-Automated where marked `[API]` (black-box tests against endpoints), manual otherwise `[UI]`.
-
-| ID | Criterion | Source |
+| 状态 | 视觉表现 | 交互要求 |
 |---|---|---|
-| A1 | Opening the homepage shows the three questions (where am I / result / next step) without scrolling on a 1280px viewport. | 31.9 |
-| A2 | No course/gamified elements (cards, coins, stars, streak flames, illustrations, animations) appear anywhere. | 26 |
-| A3 | `GET /api/home/recommendation` returns `R1` when the latest weekly assessment is failed or reinforcement is incomplete. | 26.2 |
-| A4 | Returns `R2` (exact Part number) when a material is in `DICTATION_PART_*` and no higher-priority rule matches. | 26.2 |
-| A5 | Returns `R3` for `SECOND_FULL_LISTEN` / pending second comprehension; `R4` for `READING_AVAILABLE` (Part number); `R5` for `FULL_READING_ASSESSMENT`. | 26.2 |
-| A6 | Returns `R6` (next-material CTA) when the most recent material is `LISTENING_COMPLETED` or `FULLY_COMPLETED`. | 26.2 |
-| A7 | Returns `R7` for an empty library; `priority: null` when everything is complete and gate passed. | 26.2 |
-| A8 | Priority strictly follows the ladder: with a failed gate and a dictation in progress, `R1` wins. | 26.2 |
-| A9 | Recommendation endpoint is read-only: repeated calls never change material or weekly state. | §5.2 |
-| A10 | Recent-materials rows rank in-progress before completed; clicking a row opens training at that material. | checklist §1 |
-| A11 | Cumulative minutes increase after training (compared against time logs). | checklist §1 |
-| A12 | Every page/module title renders on one line at 320px–1440px (ellipsis only as overflow). | user request |
-| A13 | Each module view shows its distinct tint (3.4); status colors match 3.3 globally. | user request |
-| A14 | Weekly Gate card reflects the latest gate outcome and opens the weekly view. | checklist §1 |
-| A15 | ≤720px: single-column layout, no horizontal overflow, no broken blocks. | checklist §5 |
-| A16 | Refreshing the page restores position; recommendation agrees with `/api/materials` states. | checklist §4 |
-| A17 | Backend-down or recommendation-endpoint failure shows clear messaging, never a white screen. | checklist §4 |
+| Default | 冷灰/白色表面、低对比边界、正常文字层级 | 保持清晰可读 |
+| Hover | 背景或边界轻微变化，最多使用对应分区浅色 | 不改变布局，不放大组件 |
+| Focus | 使用清晰、可见的 focus ring，建议 `2px` | 支持键盘导航 |
+| Selected / Active | 使用分区对应主色的浅色底、细线或状态标记 | 与 hover 明确区分 |
+| Disabled | 降低对比度和交互反馈，但保留可读性 | 不依赖透明度 alone 表达原因 |
+| Loading | 使用稳定的骨架或轻量占位，不使用跳跃式装饰动画 | 不造成布局抖动 |
+| Empty | 简短说明 + 必要行动，视觉权重低于有数据内容 | 不新增游戏化引导 |
+| Error | 图标/文字/低饱和错误色 + 可恢复操作 | 明确下一步，不改变业务错误处理逻辑 |
 
-## 9. Implementation notes
+## 8. 响应式原则
 
-- Files: `frontend/src/App.jsx` (home view markup: recommendation band + stats grid + entries), `frontend/src/styles.css` (tokens in §3), new `backend/app/core/home_recommendation.py` + route `GET /api/home/recommendation`, tests in `backend/tests/`.
-- Frontend changes require `npm run build` (FastAPI serves `frontend/dist`); verify at `http://127.0.0.1:8000`.
-- Test suite must stay green (current baseline 106 tests) — the new endpoint adds tests only; no existing test may change.
-- Acceptance environment per `docs/acceptance-checklist.md`.
+### 8.1 桌面宽度（≥ 1200px）
 
-## 10. Out of scope for V1
+- 保持窄侧栏固定在左侧，主内容区使用单一阅读主轴。
+- 当前训练卡片占据主要宽度，可在内部采用内容与状态的两列布局。
+- 素材和训练方式可采用 2–3 列，但不能压缩当前训练的留白。
 
-- User-configurable themes, dark mode, font-size settings.
-- Homepage widgets/plugins, drag-and-drop arrangement.
-- Multi-language homepage copy.
-- Real-time updates (WebSocket) or push notifications.
-- Any change to P0/P1/P2 training rules or existing endpoints.
+### 8.2 中等宽度（768–1199px）
+
+- 侧栏保持窄宽或进入可折叠模式；不得扩大为抢占内容的宽侧栏。
+- 当前训练卡片内部可从两列调整为单列。
+- 素材和训练方式卡片减少列数，优先保障名称、状态和行动可读。
+
+### 8.3 窄屏（< 768px）
+
+- 侧栏转为抽屉、底部导航或其他现有导航机制；不得丢失主要入口。
+- 三个功能分区保持顺序，不改为混合信息流。
+- 卡片纵向堆叠，主行动保持易触达；触控目标建议不小于 `44px`。
+- 页面左右内边距建议 `16–20px`。
+- 不通过缩小字号、隐藏关键状态或横向溢出来“适配”。
+
+### 8.4 通用响应式约束
+
+- 断点只改变布局，不改变业务字段、状态含义或操作结果。
+- 不出现水平滚动、文字截断导致的关键信息丢失、卡片重叠或布局跳动。
+- 加载、空状态、错误状态在不同宽度下保持同一语义和优先级。
+
+## 9. 动效与图形原则
+
+- 只使用服务于状态变化、展开收起、焦点反馈的简短动效。
+- 动效应低调、可中断、不可成为页面注意力中心。
+- 图形使用简单几何、进度、线性图标或抽象形状。
+- 禁止增加积分、等级、徽章、排行榜、连续签到、庆祝动画、拟人化角色等游戏化/教育 App 式装饰。
+
+## 10. 业务边界：明确不改业务逻辑
+
+本次实现仅允许调整 UI 层。以下内容不得修改：
+
+- 训练流程、训练规则、评分、进度计算和完成判定。
+- 素材创建、读取、排序、筛选、删除和同步逻辑。
+- 训练方式的业务定义、可用条件、权限规则和执行结果。
+- API、数据模型、状态机、路由语义、埋点事件名称及参数。
+- 用户权限、登录状态、错误处理语义和服务端契约。
+
+如现有实现缺少某个视觉所需字段，先使用已有数据或静态布局占位并记录缺口，不得擅自扩展业务逻辑。任何需要业务改动的建议应单独提交，不属于 Homepage UI V1。
+
+## 11. Non-goals
+
+- 不重构首页之外的页面或全局业务流程。
+- 不新增 Quote 或其他内容型装饰区。
+- 不引入游戏化、激励系统、教育 App 式视觉语言。
+- 不追求高密度信息仪表盘，不增加无明确决策价值的指标。
+- 不新增复杂插画、3D、渐变发光、强对立色或高饱和主题。
+- 不通过增加按钮、边框、阴影来制造“可操作感”。
+- 不改变现有业务逻辑、接口、数据和权限。
+
+## 12. 开发交付检查
+
+提交前至少确认：
+
+- [ ] 三个功能分区顺序正确，当前训练视觉权重最高。
+- [ ] Quote 及其占位空间已完全移除。
+- [ ] 页面标题已弱化，未成为 Hero。
+- [ ] 左侧导航宽度符合窄导航原则。
+- [ ] 三个主色均为低饱和冷色且明度接近，无对立色搭配。
+- [ ] 训练方式卡片已减少边框、阴影和按钮重量。
+- [ ] 空、加载、错误、选中和禁用状态有一致样式。
+- [ ] 至少验证桌面、中等和窄屏宽度，无溢出或关键内容丢失。
+- [ ] 业务逻辑、API、数据模型和埋点未被修改。
+- [ ] 提供实现前后截图或可复现页面地址，供独立验收使用。
