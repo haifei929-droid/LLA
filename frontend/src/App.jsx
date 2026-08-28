@@ -319,7 +319,7 @@ function App() {
       </section>
       </>}
 
-      {view === 'materials' && <section className="module">
+      {view === 'materials' && <section className="module module-materials">
         <button className="back" onClick={() => setView('home')}>← 返回总览</button>
         <div className="section-heading light"><div><p className="eyebrow">声音训练素材</p><h2>搜索并进入训练</h2></div><button className="secondary" onClick={() => setShowImport(!showImport)}>{showImport ? '关闭导入' : '导入素材'}</button></div>
         <form className="search-bar" onSubmit={search}><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索标题、编号或 transcript" /><button className="primary" type="submit">搜索</button></form><p className="search-hint">当前搜索范围：本地已导入素材；外部素材源将在 MaterialProvider 接入后开放。</p>
@@ -328,14 +328,14 @@ function App() {
         <div className="result-list">{materials.length ? materials.map((material) => <button className="result-row" key={material.material_id} onClick={() => openMaterial(material.material_id)}><div><strong>{material.title}</strong><p>{material.material_id} · {Math.round(material.duration_seconds)} 秒</p></div><span>{material.current_state || material.status} →</span></button>) : <p className="empty light-text">没有匹配素材。可以先导入一个预置素材。</p>}</div>
       </section>}
 
-      {view === 'weekly' && <section className="module">
+      {view === 'weekly' && <section className="module module-weekly">
         <button className="back" onClick={() => setView('home')}>← 返回总览</button>
         <div className="section-heading light"><div><p className="eyebrow">周测 Gate</p><h2>每周质量闸门</h2><p className="muted">根据当周训练内容生成测试；低于 80% 或朗读未达标时不推荐进入下一轮，转入短强化包。</p></div></div>
         <WeeklyPanel onMessage={setMessage} />
         {message && <p className="notice">{message}</p>}
       </section>}
 
-      {view === 'candidates' && <section className="module">
+      {view === 'candidates' && <section className="module module-candidates">
         <button className="back" onClick={() => setView('home')}>← 返回总览</button>
         <div className="section-heading light"><div><p className="eyebrow">候选素材（P1）</p><h2>自动获取素材</h2><p className="muted">候选先经音质三档分级与 Transcript 校验，你确认后才准备为正式素材。</p></div></div>
         <CandidatePanel
@@ -347,7 +347,7 @@ function App() {
         {message && <p className="notice">{message}</p>}
       </section>}
 
-      {view === 'p2' && <section className="module">
+      {view === 'p2' && <section className="module module-p2">
         <button className="back" onClick={() => setView('home')}>← 返回总览</button>
         <div className="section-heading light"><div><p className="eyebrow">长期训练仪表盘（P2）</p><h2>观察与解释层</h2><p className="muted">只读视图：时长 / 首次理解曲线 / 周测趋势 / 朗读三维 / 记忆深化 / 难度历史。</p></div></div>
         <P2Dashboard onMessage={setMessage} />
