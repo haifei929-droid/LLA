@@ -61,10 +61,12 @@ function App() {
   const [comprehension, setComprehension] = useState({ rating: '30–50%', summary: '' })
   const [dictationContext, setDictationContext] = useState(null)
   const [firstListenPlayed, setFirstListenPlayed] = useState(false)
+  const [loading, setLoading] = useState(true)
 
   const refresh = () => fetch('/api/materials')
     .then((response) => response.json())
-    .then((payload) => { setMaterials(payload) })
+    .then((payload) => { setMaterials(payload); setLoading(false) })
+    .catch(() => setLoading(false))
 
   useEffect(() => {
     fetch('/api/health')
@@ -109,6 +111,17 @@ function App() {
     if (key === 'weekly') { setView('weekly'); return }
     if (currentMaterial) openMaterial(currentMaterial.material_id)
     else setView('materials')
+  }
+
+  const retry = () => {
+    setLoading(true)
+    fetch('/api/health')
+      .then((response) => response.json())
+      .then((payload) => {
+        setHealth(payload.status === 'ok' ? '训练核心已就绪' : '训练核心异常')
+        return refresh()
+      })
+      .catch(() => { setHealth('后端尚未启动'); setLoading(false) })
   }
 
   const refreshDictationContext = () => {
@@ -339,9 +352,16 @@ function App() {
         </header>
 
         {view === 'home' && <>
-          <section className="home-section">
+          {health === '后端尚未启动' && <div className="notice error">后端尚未启动，无法加载训练数据。<button className="link-btn" onClick={retry}>重试</button></div>}
+          <section className="home-section accent-training">
             <p className="section-label">当前训练</p>
-            {currentMaterial ? (
+            {loading ? (
+              <div className="training-hero skeleton-block">
+                <div className="sk-line sk-short"></div>
+                <div className="sk-line sk-wide"></div>
+                <div className="sk-line"></div>
+              </div>
+            ) : currentMaterial ? (
               <div className="training-hero">
                 <div className="hero-meta">
                   <span className="hero-state">{stateText(currentMaterial.current_state)}</span>
@@ -363,7 +383,7 @@ function App() {
             )}
           </section>
 
-          <section className="home-section">
+          <section className="home-section accent-material">
             <p className="section-label">当前素材 / 新素材</p>
             <div className="material-cards">
               {currentMaterial ? (
@@ -389,7 +409,7 @@ function App() {
             </div>
           </section>
 
-          <section className="home-section">
+          <section className="home-section accent-modes">
             <p className="section-label">训练方式</p>
             <div className="mode-cards">
               {TRAINING_MODES.map((mode) => (

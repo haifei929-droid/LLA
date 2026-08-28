@@ -2,44 +2,61 @@
 
 - **Spec:** `docs/Homepage_UI_V1_Development_Spec.md`（唯一权威来源，2026-08-28）
 - **Scope:** 仅首页 UI；不改业务逻辑、API、数据模型或状态机（Spec §10）
-- **Evidence types:** DOM 结构（自动）、截图（人工）、代码 diff、测试基线
+- **Evidence types:** DOM 结构（自动）、计算样式（自动）、截图（人工）、隔离库功能回归（自动）、测试基线
 
-## 1. 交付检查矩阵（Spec §12）
+## 1. 第二次独立验收问题整改
+
+| 验收问题 | 严重度 | 整改 | 证据 |
+|---|---|---|---|
+| P0-06 三色只写注释、未应用 | 必须改正 | 蓝灰/青灰/紫灰落到分区色条、标签圆点、深色文字与 hover 表面 | 计算样式：hero `rgb(127,152,170)`、material `rgb(127,169,167)`、mode `rgb(146,142,170)`、label dot `rgb(127,152,170)` |
+| P0-09/P0-10 仅入口级验证 | 必须改正 | 隔离临时库端到端回归 FR-01/02/03 | 见 §3 |
+| P1-02 无 focus ring | 应当改正 | 全局 `:focus-visible { outline: 2px solid #607b8a; outline-offset: 2px }` | styles.css |
+| P1-07 侧栏按钮 42.4px | 应当改正 | `.sidebar-nav button { min-height: 44px }` | 计算样式 `44px` |
+| P1-01/P1-06 缺 Loading/Error | 应当改正 | 首页骨架 Loading + 后端不可用错误态（含重试） | App.jsx `loading`/`retry`；`.skeleton-block`/`.notice.error` |
+| 截图尺寸不符 | 建议 | 重拍 1440×900 / 1024×768 / 390×844 | `docs/screenshots/home-{desktop,medium,narrow}.png` |
+
+## 2. 交付检查矩阵（Spec §12）
 
 | # | 检查项 | 结果 | 证据 |
 |---|---|---|---|
-| 1 | 三个功能分区顺序正确，当前训练视觉权重最高 | ✅ | DOM：`.section-label` 顺序 = 当前训练 → 当前素材/新素材 → 训练方式；`.training-hero` 为唯一大卡片（40/48px 内边距、24px 圆角、白底） |
-| 2 | Quote 及占位空间完全移除 | ✅ | DOM：`.hero` / `.recommendation` / `.grid` 计数 = 0 |
-| 3 | 页面标题已弱化 | ✅ | `.page-title` 22px / weight 500，低于当前训练标题（clamp 26–32px / 700） |
-| 4 | 左侧导航窄 | ✅ | `.sidebar` width 208px（192–224px 范围内），导航 5 项 |
-| 5 | 三低饱和冷色、明度接近、无对立色 | ✅ | `#7f98aa`（当前训练蓝灰）/ `#7fa9a7`（素材青灰）/ `#928eaa`（训练方式紫灰）；页底 `#f4f6f8` |
-| 6 | 训练方式卡轻量 | ✅ | `.mode-card` 弱边框 1px `#e0e6ea`、无阴影、hover 仅换底 |
-| 7 | 空/加载/错误/选中/禁用状态一致 | ⚠️ 首页部分 | 首页空态 `empty-hero` / 选中 `sidebar .active` 已统一；训练页沿用已验收状态色（§10 不重构） |
-| 8 | 桌面/中等/窄屏无溢出 | ✅ | Playwright 截图三档（见 §2） |
-| 9 | 业务逻辑/API/数据/埋点未改 | ✅ | 后端推荐端点已回退；`pytest` 106/106 基线不变 |
-| 10 | 提供实现截图 | ✅ | `docs/screenshots/home-{desktop,medium,narrow}.png` |
+| 1 | 三功能分区顺序正确、当前训练权重最高 | ✅ | DOM 顺序；`.training-hero` 大卡 40/48px 内边距 |
+| 2 | Quote 完全移除 | ✅ | `.hero`/`.recommendation`/`.grid` 计数 0，无 blockquote |
+| 3 | 页面标题弱化 | ✅ | `.page-title` 22px/500，低于 hero 标题 32px/700 |
+| 4 | 左侧导航窄 | ✅ | `.sidebar` 208px |
+| 5 | 三低饱和冷色实际应用 | ✅ | 计算样式见 §1 |
+| 6 | 训练方式卡轻量 | ✅ | 1px 弱边框、无阴影、hover 浅紫灰面 |
+| 7 | 状态一致 | ✅ | 默认/hover/active/empty + 骨架 Loading + Error 恢复态 |
+| 8 | 三档宽度无溢出 | ✅ | 1440/1024/390 `overflow=False` |
+| 9 | 业务逻辑/API 未改 | ✅ | `/api/home/recommendation` 已删；`pytest` 106/106 |
+| 10 | 截图证据 | ✅ | 三视口 + 功能回归截图 |
 
-## 2. 截图证据（人工验收）
+## 3. 隔离库功能回归（P0-09/10 完整结果）
 
-| 视口 | 文件 | 尺寸 |
+在独立临时数据库 + 8001 端口跑通（不污染主库）：
+
+| 用例 | 结果 | 证据 |
 |---|---|---|
-| 桌面 | `docs/screenshots/home-desktop.png` | 1280×800 |
-| 中等 | `docs/screenshots/home-medium.png` | 900×800 |
-| 窄屏 | `docs/screenshots/home-narrow.png` | 390×844 |
+| FR-02 无素材空状态 | ✅ | `empty-hero` 存在，文案「还没有开始训练」 |
+| FR-03 当前素材显示 | ✅ | 创建后 hero 标题/状态「首次盲听」/素材卡正确 |
+| FR-01 继续当前训练（完整） | ✅ | 状态推进「首次盲听→理解检查→听写 Part 1」，点击「继续训练」进入训练页且听写面板渲染 |
 
-## 3. 本次纠正（相对前次偏离）
+截图：`docs/screenshots/home-e2e-{empty,current,training}.png`。
 
-| 项 | 前次（已回退） | 本次 |
+## 4. 仍待独立验收确认
+
+- [ ] FR-04 新素材完整创建/选择（候选素材依赖外网 VOA/BBC，需真实验收）
+- [ ] FR-06 不可用训练方式（当前数据无此状态）
+- [ ] FR-10 权限/受限请求错误反馈
+- [ ] 完整听写/朗读评分流程（后端 106 测试已覆盖，前端面板渲染已验证）
+- [ ] 真实触控设备误触检查
+
+## 5. 截图证据清单
+
+| 文件 | 视口 | 用途 |
 |---|---|---|
-| 首页结构 | 推荐梯 + 统计网格 | 三段式：当前训练 → 当前素材/新素材 → 训练方式 |
-| Quote | 保留 hero 大字标语 | 移除 |
-| 顶部标题 | 48px Hero 标题 | 22px 弱标题 |
-| 侧栏 | 无 | 208px 窄侧栏 |
-| 色系 | 绿/紫/青/米杂色 | 三低饱和冷色 + 冷灰底 |
-| 后端 | 新增 `/api/home/recommendation` | 回退，纯前端，复用现有端点 |
-
-## 4. 待人工确认
-
-- [ ] 三档截图视觉复核（冷色、留白、层级、无溢出）
-- [ ] 窄屏触控目标 ≥ 44px
-- [ ] 键盘焦点可见（focus ring 2px）
+| `home-desktop.png` | 1440×900 | 桌面布局 |
+| `home-medium.png` | 1024×768 | 中等宽度 |
+| `home-narrow.png` | 390×844 | 窄屏 |
+| `home-e2e-empty.png` | 1440×900 | 空状态 |
+| `home-e2e-current.png` | 1440×900 | 当前训练/素材 |
+| `home-e2e-training.png` | 1440×900 | 继续训练进入听写面板 |
