@@ -247,11 +247,20 @@ class DifficultyProgressionService:
             and profile["current_stage"] != "STAGE_3"
             and (profile["cooldown_until"] is None or datetime.fromisoformat(profile["cooldown_until"]) <= self.now_fn())
         )
+        was_eligible = profile["upgrade_eligible"]
         self._update_profile(
             scope_id,
             consecutive_pass_weeks=consecutive,
             upgrade_eligible=int(eligible),
         )
+        # Record UPGRADE_ELIGIBLE at the moment eligibility is reached
+        # (false -> true edge), not only when a prompt is generated.
+        if eligible and not was_eligible and self.history is not None:
+            self.history.record(
+                scope_id, "UPGRADE_ELIGIBLE", stage_before=stage, stage_after=stage,
+                reason=f"{STABLE_WEEKS_REQUIRED} consecutive stable passes",
+                occurred_at=self.now_fn().isoformat(),
+            )
 
     # ---------- prompt & decision ----------
 
@@ -296,11 +305,8 @@ class DifficultyProgressionService:
             )
         if self.history is not None:
             stage = profile["current_stage"]
-            self.history.record(
-                scope_id, "UPGRADE_ELIGIBLE", stage_before=stage, stage_after=stage,
-                reason=f"{STABLE_WEEKS_REQUIRED} consecutive stable passes",
-                occurred_at=self.now_fn().isoformat(),
-            )
+            # UPGRADE_ELIGIBLE is recorded by _recompute_consecutive at the
+            # moment eligibility is reached; here only the prompt is logged.
             self.history.record(
                 scope_id, "UPGRADE_PROMPTED", stage_before=stage, stage_after=stage,
                 source_record_ids=[prompt_id], reason="prompt shown to user",

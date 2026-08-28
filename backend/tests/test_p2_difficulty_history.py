@@ -78,6 +78,8 @@ def test_upgrade_flow_emits_eligible_prompted_decided_stage_changed(tmp_path: Pa
 
     types = {event["event_type"] for event in history.history("default")["events"]}
     assert {"UPGRADE_ELIGIBLE", "UPGRADE_PROMPTED", "UPGRADE_DECIDED", "STAGE_CHANGED"}.issubset(types)
+    eligible_events = [e for e in history.history("default")["events"] if e["event_type"] == "UPGRADE_ELIGIBLE"]
+    assert len(eligible_events) == 1, "eligibility is recorded once at the moment it is reached"
     stage_changed = [e for e in history.history("default")["events"] if e["event_type"] == "STAGE_CHANGED"][0]
     assert stage_changed["stage_before"] == "STAGE_1"
     assert stage_changed["stage_after"] == "STAGE_2"

@@ -138,3 +138,32 @@ def test_dashboard_weekly_and_reading(tmp_path: Path) -> None:
     streak = result["trend"]["difficulty_streak"]
     assert streak["current_stage"] == "STAGE_1"
     assert streak["source"] == "P1 weekly_gate_records"
+
+
+def test_dashboard_weekly_reading_dimension_series(tmp_path: Path) -> None:
+    """P2.READING.WEEKLY_DIMENSION: weekly-assessments dimensions form an
+    independent series; a week without a reading test is not_applicable,
+    never FAIL."""
+    db = make_database(tmp_path)
+    with db.connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO weekly_assessments(
+                week_id, period_start, period_end, dictation_required, reading_required,
+                reading_dimension_results, gate_status, created_at
+            ) VALUES
+                ('W-R1', '2026-08-01', '2026-08-07', 1, 1,
+                 '{"speed": true, "pause": false, "stress": true}', 'REINFORCEMENT_REQUIRED', '2026-08-07T10:00:00+00:00'),
+                ('W-R2', '2026-08-08', '2026-08-14', 1, 0, '{}', 'WEEKLY_GATE_PASS', '2026-08-14T10:00:00+00:00')
+            """
+        )
+    service = DashboardService(db)
+    result = service.read(scope_id="default")
+    series = result["trend"]["weekly_reading"]
+    by_week = {entry["period"]: entry for entry in series}
+    assert by_week["W-R1"]["speed"] == "PASS"
+    assert by_week["W-R1"]["pause"] == "FAIL"
+    assert by_week["W-R1"]["stress"] == "PASS"
+    assert by_week["W-R1"]["missing_reason"] is None
+    assert by_week["W-R2"]["missing_reason"] == "not_applicable"
+    assert by_week["W-R2"]["speed"] is None

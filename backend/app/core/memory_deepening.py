@@ -56,7 +56,7 @@ class MemoryDeepeningService:
         with self.database.connect() as connection:
             attempts = connection.execute(
                 """
-                SELECT a.sentence_id, a.user_text, a.listen_count, a.hint_level,
+                SELECT a.attempt_id, a.sentence_id, a.user_text, a.listen_count, a.hint_level,
                        a.revealed, a.error_details, a.created_at,
                        s.text AS expected_text, s.material_id, s.part_no
                   FROM dictation_attempts a
@@ -114,6 +114,7 @@ class MemoryDeepeningService:
                     episode["first_exact_listen_count"] = attempt["listen_count"]
 
         created = 0
+        source_ids: list[str] = []
         with self.database.connect() as connection:
             for episode in episodes.values():
                 connection.execute(
@@ -125,7 +126,7 @@ class MemoryDeepeningService:
                     (str(uuid4()), scope_id, episode["target"], episode["material_id"],
                      episode["sentence_id"], episode["part_no"], self.now_fn().isoformat()),
                 )
-                connection.execute(
+                inserted = connection.execute(
                     """
                     INSERT OR IGNORE INTO memory_recognition_episodes(
                         episode_id, scope_id, target, occurrence_id, sentence_id,
@@ -141,7 +142,32 @@ class MemoryDeepeningService:
                         episode["date"], self.now_fn().isoformat(),
                     ),
                 )
-                created += 1
+                if inserted.rowcount:
+                    created += 1
+            # Mandatory backfill audit (P2 spec 10.1): every backfill writes an
+            # audit row with source linkage, derived fields, versions and
+            # reliability. Fields like first-correct/episode boundaries are
+            # derived from attempt linkage, so they are CONDITIONAL per 10.3.
+            source_ids = [row["attempt_id"] for row in attempts]
+            connection.execute(
+                """
+                INSERT INTO backfill_audits(
+                    audit_id, scope_id, source_record_ids_json, fields_derived_json,
+                    source_schema_version, metric_version, reliability,
+                    unavailable_reasons_json, backfilled_at
+                ) VALUES (?, ?, ?, ?, '1.0', '1.0', 'CONDITIONAL', '{}', ?)
+                """,
+                (
+                    str(uuid4()), scope_id,
+                    json.dumps(source_ids[:500]),
+                    json.dumps(
+                        ["memory_target_occurrences", "memory_recognition_episodes",
+                         "first_exact_listen_count", "revealed", "hint_used", "attempt_count"],
+                        sort_keys=True,
+                    ),
+                    self.now_fn().isoformat(),
+                ),
+            )
         return created
 
     @staticmethod
@@ -275,6 +301,14 @@ class MemoryDeepeningService:
                 config,
                 avg_first_correct,
             )
+            confidence = round(
+                min(
+                    1.0,
+                    0.5 * aggregate["qualifying_episodes"] / config["min_episodes"]
+                    + 0.5 * distinct_dates / config["min_dates"],
+                ),
+                2,
+            )
             targets.append(
                 {
                     "target": target,
@@ -286,6 +320,7 @@ class MemoryDeepeningService:
                     "hint_count": aggregate["hint_count"],
                     "reveal_count": aggregate["reveal_count"],
                     "difficulty_classification": classification,
+                    "confidence": confidence,
                     "thresholds_applied": {
                         "short_days": config["short_days"],
                         "long_days": config["long_days"],

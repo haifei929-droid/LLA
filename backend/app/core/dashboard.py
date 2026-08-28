@@ -72,6 +72,7 @@ class DashboardService:
             "time_series": self._time_series(closed_logs, granularity),
             "first_comprehension_curve": self._first_comprehension_curve(scope_id, range_start, range_end),
             "weekly_dictation": self._weekly_dictation(scope_id, range_start, range_end),
+            "weekly_reading": self._weekly_reading(scope_id, range_start, range_end),
             "reading_practice": self._reading_practice(scope_id, range_start, range_end),
             "difficulty_streak": self._difficulty_streak(scope_id),
         }
@@ -219,6 +220,48 @@ class DashboardService:
         return points
 
     # ---------- READING ----------
+
+    def _weekly_reading(self, scope_id: str, range_start: str | None, range_end: str | None) -> list[dict[str, Any]]:
+        """Weekly Test reading dimension series (P2.READING.WEEKLY_DIMENSION).
+
+        Uses weekly_assessments.reading_dimension_results only; practice
+        attempts stay in their own series and are never merged. A week
+        without a reading test is 'not_applicable', never FAIL."""
+        with self.database.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT week_id, reading_required, reading_dimension_results, created_at
+                  FROM weekly_assessments ORDER BY created_at
+                """
+            ).fetchall()
+        series = []
+        for row in rows:
+            if (range_start and row["created_at"] < range_start) or (range_end and row["created_at"] > range_end):
+                continue
+            dimensions = json.loads(row["reading_dimension_results"])
+            if not row["reading_required"] or not dimensions:
+                series.append(
+                    {
+                        "metric_id": "P2.READING.WEEKLY_DIMENSION",
+                        "period": row["week_id"],
+                        "speed": None,
+                        "pause": None,
+                        "stress": None,
+                        "missing_reason": "not_applicable" if not row["reading_required"] else "not_recorded",
+                    }
+                )
+                continue
+            series.append(
+                {
+                    "metric_id": "P2.READING.WEEKLY_DIMENSION",
+                    "period": row["week_id"],
+                    "speed": "PASS" if dimensions.get("speed") else "FAIL",
+                    "pause": "PASS" if dimensions.get("pause") else "FAIL",
+                    "stress": "PASS" if dimensions.get("stress") else "FAIL",
+                    "missing_reason": None,
+                }
+            )
+        return series
 
     def _reading_practice(self, scope_id: str, range_start: str | None, range_end: str | None) -> dict[str, Any]:
         with self.database.connect() as connection:

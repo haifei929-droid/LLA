@@ -1,4 +1,4 @@
-﻿"""P2-2 Listening Memory deepening tests: episodes, first-correct metric
+"""P2-2 Listening Memory deepening tests: episodes, first-correct metric
 (excluding Hint/Reveal), SPELLING exclusion, weekly-test separation,
 threshold configuration, classification, review suggestions."""
 
@@ -163,6 +163,63 @@ def test_weekly_test_never_enters_ordinary_memory(tmp_path: Path) -> None:
     service.save_config("default", **DEFAULT_THRESHOLDS)
     result = service.read_memory("default")
     assert result["targets"] == []
+
+
+def test_backfill_writes_mandatory_audit(tmp_path: Path) -> None:
+    """P2 spec 10.1: every backfill records source linkage, derived fields,
+    versions and reliability (CONDITIONAL for derived first-correct/episode
+    boundaries); raw dictation attempts are untouched; reruns are idempotent
+    for episodes and append audit rows per run."""
+    db, service = _service(tmp_path)
+    _seed_dictation(
+        db, sentence_id="mem-m1-sentence-001", material_id="mem-m1",
+        expected=DEFAULT_SENTENCES[0],
+        attempts=[(DEFAULT_SENTENCES[0].replace("lazy", "sleepy"), 2, 0, False), (DEFAULT_SENTENCES[0], 4, 0, False)],
+    )
+    created = service.build_episodes("default")
+    assert created >= 1
+    with db.connect() as connection:
+        audit = connection.execute("SELECT * FROM backfill_audits ORDER BY backfilled_at DESC LIMIT 1").fetchone()
+        episodes = connection.execute("SELECT COUNT(*) AS n FROM memory_recognition_episodes").fetchone()["n"]
+        attempts_before = connection.execute("SELECT COUNT(*) AS n FROM dictation_attempts").fetchone()["n"]
+    assert audit is not None
+    assert audit["reliability"] == "CONDITIONAL"
+    assert audit["source_schema_version"] == "1.0"
+    assert audit["metric_version"] == "1.0"
+    assert "first_exact_listen_count" in audit["fields_derived_json"]
+    assert audit["source_record_ids_json"] != "[]"
+
+    # Idempotent rerun: no new episodes, but a second audit row (per-run log).
+    again = service.build_episodes("default")
+    assert again == 0
+    with db.connect() as connection:
+        episodes_after = connection.execute("SELECT COUNT(*) AS n FROM memory_recognition_episodes").fetchone()["n"]
+        attempts_after = connection.execute("SELECT COUNT(*) AS n FROM dictation_attempts").fetchone()["n"]
+        audit_count = connection.execute("SELECT COUNT(*) AS n FROM backfill_audits").fetchone()["n"]
+    assert episodes_after == episodes
+    assert attempts_after == attempts_before, "raw dictation data must never be modified by backfill"
+    assert audit_count >= 2
+
+
+def test_target_aggregate_exposes_confidence(tmp_path: Path) -> None:
+    db, service = _service(tmp_path)
+    _add_sentences(db, ["The lazy fox sleeps all day.", "She saw the lazy cat outside."])
+    expected = ["The lazy fox sleeps all day.", "She saw the lazy cat outside."]
+    wrong = ["The sleepy fox sleeps all day.", "She saw the sleepy cat outside."]
+    for index in range(2):
+        _seed_dictation(
+            db, sentence_id=f"mem-m1-custom-{index + 1:03d}", material_id="mem-m1",
+            expected=expected[index],
+            attempts=[(wrong[index], 2, 0, False), (expected[index], 3, 0, False)],
+            created_days_ago=index,
+        )
+    service.build_episodes("default")
+    service.save_config("default", short_days=14, long_days=56, min_episodes=3, min_dates=2)
+    result = service.read_memory("default")
+    lazy = [t for t in result["targets"] if t["target"] == "lazy"][0]
+    # 2/3 episodes + 2/2 dates -> 0.5*0.667 + 0.5*1.0 = 0.83.
+    assert lazy["confidence"] == pytest.approx(0.83, abs=0.01)
+    assert 0.0 <= lazy["confidence"] <= 1.0
 
 
 def _add_sentences(db: Database, texts: list[str], material_id: str = "mem-m1") -> None:
