@@ -107,22 +107,21 @@ def test_listening_loop_guards_and_completes(client: TestClient) -> None:
     incomplete = client.post(f"/api/materials/{material_id}/dictation-parts/1/complete")
     assert incomplete.status_code == 400
 
-    # Complete Part 1 with a wrong-then-exact pair, then finish Parts 2 and 3.
+    # Complete Part 1 with a wrong-then-exact pair; the final exact submit
+    # completes the Part atomically (no separate Part completion call).
     assert _dictate(client, material_id, 2, "She sells seashells wrong", listen_count=2).json()["is_exact_match"] is False
     assert _dictate(client, material_id, 2, DEFAULT_SENTENCES[1], listen_count=3).status_code == 200
-    assert _dictate(client, material_id, 3, DEFAULT_SENTENCES[2]).status_code == 200
-    assert (
-        client.post(f"/api/materials/{material_id}/dictation-parts/1/complete").json()["current_state"]
-        == "DICTATION_PART_2"
-    )
+    last = _dictate(client, material_id, 3, DEFAULT_SENTENCES[2])
+    assert last.status_code == 200
+    assert last.json()["transition_type"] == "PART_COMPLETED"
+    assert last.json()["next_state"] == "DICTATION_PART_2"
     for part, indexes in ((2, (3, 4, 5)), (3, (6, 7, 8))):
+        last = None
         for index in indexes:
-            assert _dictate(client, material_id, index + 1, DEFAULT_SENTENCES[index]).status_code == 200
+            last = _dictate(client, material_id, index + 1, DEFAULT_SENTENCES[index])
+            assert last.status_code == 200
         expected = "SECOND_FULL_LISTEN" if part == 3 else f"DICTATION_PART_{part + 1}"
-        assert (
-            client.post(f"/api/materials/{material_id}/dictation-parts/{part}/complete").json()["current_state"]
-            == expected
-        )
+        assert last.json()["next_state"] == expected
 
     # Second listen and comprehension unlock reading; skipping is legal.
     assert (

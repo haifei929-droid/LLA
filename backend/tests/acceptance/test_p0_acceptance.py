@@ -78,12 +78,13 @@ def test_full_material_loop_to_completion(client: TestClient, tmp_path: Path) ->
     ).json()["current_state"] == "DICTATION_PART_1"
 
     for part in (1, 2, 3):
+        last = None
         for index in range((part - 1) * 3, part * 3):
             # One wrong attempt, then exact.
             assert _dictate(client, mid, index + 1, "wrong", listen_count=1).json()["is_exact_match"] is False
-            assert _dictate(client, mid, index + 1, DEFAULT_SENTENCES[index], listen_count=2).status_code == 200
-        response = client.post(f"/api/materials/{mid}/dictation-parts/{part}/complete")
-        assert response.status_code == 200, response.text
+            last = _dictate(client, mid, index + 1, DEFAULT_SENTENCES[index], listen_count=2)
+            assert last.status_code == 200, last.text
+        assert last.json()["transition_type"] == "PART_COMPLETED"
 
     assert client.post(f"/api/materials/{mid}/second-listen/complete").json()["current_state"] == "SECOND_COMPREHENSION_CHECK"
     assert client.post(

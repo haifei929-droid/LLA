@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useRef, useState } from 'react'
 
 // Hint formats are a Spec "待校准" item; these minimal placeholders only
 // reveal position and length, never the word itself.
@@ -26,7 +26,13 @@ function errorClass(errorType) {
   }[errorType] || 'err-blank'
 }
 
-function DictationPanel({ materialId, context, onAdvance, onPartComplete, onMessage }) {
+function newOperationId() {
+  return typeof crypto !== 'undefined' && crypto.randomUUID
+    ? crypto.randomUUID()
+    : `${Date.now()}-${Math.random().toString(16).slice(2)}`
+}
+
+function DictationPanel({ materialId, context, onTransition, onPartComplete, onMessage }) {
   const [input, setInput] = useState('')
   const [listenCount, setListenCount] = useState(0)
   const [result, setResult] = useState(null)
@@ -42,19 +48,9 @@ function DictationPanel({ materialId, context, onAdvance, onPartComplete, onMess
   const current = sentences.find((sentence) => !sentence.is_exact)
   const doneCount = sentences.filter((sentence) => sentence.is_exact).length
 
-  useEffect(() => {
-    if (result && result.is_exact_match) {
-      // Sentence passed: move on automatically after a short confirmation.
-      onMessage('本句逐字正确，进入下一句。')
-      setInput('')
-      setListenCount(0)
-      setResult(null)
-      setHintLevel(0)
-      setRevealedText(null)
-      onAdvance() // 普通句完成：重新读取 context，进入下一句
-    }
-  }, [result, onAdvance, onMessage])
-
+  // Defensive/recovery path only: the normal flow completes a Part atomically
+  // inside sentence submit, so this branch is only reached for legacy data
+  // where a Part is fully exact but the state has not advanced yet.
   const completePart = async () => {
     if (partSubmittingRef.current) return
     partSubmittingRef.current = true
@@ -107,6 +103,7 @@ function DictationPanel({ materialId, context, onAdvance, onPartComplete, onMess
         listen_count: listenCount,
         hint_level: revealed ? 0 : hintLevel,
         revealed,
+        operation_id: newOperationId(),
       }),
     })
       .then(async (response) => {
@@ -115,9 +112,22 @@ function DictationPanel({ materialId, context, onAdvance, onPartComplete, onMess
         return payload
       })
       .then((payload) => {
-        setResult(payload)
-        if (payload.revealed || payload.expected_text) {
-          setRevealedText(payload.expected_text)
+        if (payload.is_exact_match) {
+          // The server is the sole transition authority: it returns the next
+          // state / sentence / action, and (for continue-dictation) the next
+          // context to render directly. The frontend derives nothing locally.
+          onMessage('本句逐字正确。')
+          setInput('')
+          setListenCount(0)
+          setResult(null)
+          setHintLevel(0)
+          setRevealedText(null)
+          onTransition(payload)
+        } else {
+          setResult(payload)
+          if (payload.revealed || payload.expected_text) {
+            setRevealedText(payload.expected_text)
+          }
         }
       })
       .catch((error) => onMessage(error.message))

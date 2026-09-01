@@ -266,7 +266,16 @@ function App() {
       return <DictationPanel
         materialId={selected.material_id}
         context={dictationContext}
-        onAdvance={refreshDictationContext}
+        onTransition={(payload) => {
+          if (payload.next_action === 'SECOND_LISTEN') {
+            setSelected((current) => current ? { ...current, current_state: payload.next_state } : current)
+            setDictationContext(null)
+          } else if (payload.next_context) {
+            setDictationContext(payload.next_context)
+          } else {
+            refreshDictationContext()
+          }
+        }}
         onPartComplete={() => {
           const part = Number(state.slice(-1))
           return fetch(`/api/materials/${selected.material_id}/dictation-parts/${part}/complete`, { method: 'POST' })

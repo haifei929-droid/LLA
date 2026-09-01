@@ -74,11 +74,16 @@ def main():
         with sync_playwright() as p:
             browser = p.chromium.launch()
             page = browser.new_page(viewport={"width": 1280, "height": 900})
+
+            part_completion_calls = []
+            page.on("request", lambda req: part_completion_calls.append(req.url)
+                    if "/dictation-parts/" in req.url else None)
+
             page.goto(BASE, wait_until="networkidle")
             page.locator(".training-hero .primary").click()
             page.wait_for_selector(".dictation-panel", timeout=8000)
 
-            # 验证 A：快速连点不产生重复 Sentence completion
+            # 句 1：快速连点不产生重复 attempt（operation_id 幂等 + 前端 ref 守卫）
             page.locator("text=播放本句").click()
             page.locator(".dictation-input").fill(SENTENCES[0])
             page.evaluate("""() => {
@@ -89,46 +94,33 @@ def main():
                 "() => document.querySelector('.dictation-progress')?.textContent.includes('已正确 1 / 3')",
                 timeout=8000,
             )
-            a1 = attempt_count(1)
-            print(f"验证A 句1 attempt 数 = {a1}（期望 1）")
-            assert a1 == 1, "快速连点产生了重复 Sentence completion"
+            print(f"句1 后 attempt 数 = {attempt_count(1)}（期望 1）")
+            assert attempt_count(1) == 1
 
-            # 验证 B：refetch 失败 → 显式 Retry UI → 点击恢复
-            fail_next = {"on": True}
-
-            def handle_route(route):
-                if fail_next["on"]:
-                    fail_next["on"] = False
-                    route.fulfill(status=500, content_type="application/json",
-                                  body='{"detail":"simulated failure"}')
-                else:
-                    route.continue_()
-
-            page.route("**/dictation-context", handle_route)
+            # 句 2：普通句 → 服务端返回 next_context 直接渲染句 3
             page.locator("text=播放本句").click()
             page.locator(".dictation-input").fill(SENTENCES[1])
             page.locator("button:has-text('提交')").click()
-            page.wait_for_selector("button:has-text('重新加载上下文')", timeout=8000)
-            print("验证B refetch 失败 → Retry UI 出现")
-            page.locator("button:has-text('重新加载上下文')").click()
             page.wait_for_function(
                 "() => document.querySelector('.dictation-progress')?.textContent.includes('已正确 2 / 3')",
                 timeout=8000,
             )
-            print("验证B 点击 Retry 后恢复（已正确 2 / 3）")
+            print("句2 后自动进入句3（已正确 2/3）")
 
-            # 验证 C：最后一句完成 → Part completion → 进入 Part 2
+            # 句 3：末句 → 服务端原子完成 Part 1 → 直接进入 Part 2
             page.locator("text=播放本句").click()
             page.locator(".dictation-input").fill(SENTENCES[2])
             page.locator("button:has-text('提交')").click()
-            page.wait_for_selector("button:has-text('完成 Part')", timeout=8000)
-            print("验证C 句3完成 → 出现「完成 Part」按钮")
-            page.locator("button:has-text('完成 Part')").click()
             page.wait_for_function(
                 "() => document.querySelector('.dictation-progress')?.textContent.includes('Part 2')",
                 timeout=8000,
             )
-            print("验证C 点击「完成 Part」→ 进入 Part 2，无永久 loading")
+            print("句3 后原子进入 Part 2（无刷新、无完成 Part 按钮）")
+
+            # 主路径不应再调用 deprecated Part completion API
+            assert not any("/dictation-parts/" in u for u in part_completion_calls), \
+                f"主路径调用了 Part completion API: {part_completion_calls}"
+            print("主路径未调用 /dictation-parts/ API")
 
             browser.close()
     finally:

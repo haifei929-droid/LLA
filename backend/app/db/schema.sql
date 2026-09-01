@@ -66,6 +66,18 @@ CREATE TABLE IF NOT EXISTS dictation_attempts (
     UNIQUE(sentence_id, attempt_number)
 );
 
+-- Idempotency ledger for dictation submit operations. The stored `result` is
+-- the exact business payload returned on first success, so a replayed
+-- operation_id returns an identical result without a second attempt or a
+-- repeated Part transition.
+CREATE TABLE IF NOT EXISTS dictation_operations (
+    operation_id TEXT PRIMARY KEY,
+    material_id TEXT NOT NULL,
+    sentence_id TEXT NOT NULL,
+    result TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS comprehension_checks (
     check_id TEXT PRIMARY KEY,
     material_id TEXT NOT NULL REFERENCES materials(material_id),

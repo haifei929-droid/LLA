@@ -320,6 +320,10 @@ def submit_comprehension(
 
 @router.post("/materials/{material_id}/dictation-parts/{part_no}/complete")
 def complete_dictation_part(material_id: str, part_no: int, request: Request) -> dict[str, object]:
+    # DEPRECATED (P2 Sentence Transition): the normal training path now
+    # completes a Part atomically inside sentence submit. This endpoint is kept
+    # only for compatibility/recovery; calling it after submit has already
+    # advanced the state yields 409, so it cannot double-transition a Part.
     return _event_result(
         lambda: request.app.state.training_events.complete_dictation_part(material_id, part_no)
     )
@@ -586,6 +590,7 @@ def submit_dictation(
             hint_level=payload.hint_level,
             revealed=payload.revealed,
             memory_targets=payload.memory_targets,
+            operation_id=payload.operation_id,
         )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc

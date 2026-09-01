@@ -64,27 +64,30 @@ def test_training_event_service_reaches_full_completion(tmp_path: Path) -> None:
         events.complete_dictation_part("m1", 2)
 
     expected_texts = [f"Sentence {index}." for index in range(1, 10)]
+    last = None
     for index, sentence_id in enumerate(sentence_ids[:3]):
         dictation.submit(
             material_id="m1", sentence_id=sentence_id, user_text="wrong", listen_count=1
         )
-        dictation.submit(
+        last = dictation.submit(
             material_id="m1",
             sentence_id=sentence_id,
             user_text=expected_texts[index],
             listen_count=2,
         )
-    assert events.complete_dictation_part("m1", 1).current_state == MaterialState.DICTATION_PART_2
+    assert last["transition_type"] == "PART_COMPLETED"
+    assert last["next_state"] == MaterialState.DICTATION_PART_2.value
 
     for part_no, offset in ((2, 3), (3, 6)):
+        last = None
         for index in range(offset, offset + 3):
-            dictation.submit(
+            last = dictation.submit(
                 material_id="m1",
                 sentence_id=sentence_ids[index],
                 user_text=f"Sentence {index + 1}.",
                 listen_count=1,
             )
-        assert events.complete_dictation_part("m1", part_no).dictation_part_status[str(part_no)] is True
+        assert last["transition_type"] == "PART_COMPLETED"
 
     assert events.complete_second_listen("m1").current_state == MaterialState.SECOND_COMPREHENSION_CHECK
     assert events.submit_comprehension(

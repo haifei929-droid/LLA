@@ -60,7 +60,7 @@ def _drive_to_reading(database: Database, material_id: str) -> None:
                 user_text=DEFAULT_SENTENCES[index],
                 listen_count=1,
             )
-        events.complete_dictation_part(material_id, part)
+    # The final sentence of each Part completes it atomically inside submit.
     events.complete_second_listen(material_id)
     events.submit_comprehension(
         material_id=material_id, phase="SECOND", self_rating=">70%", summary="Reading test."

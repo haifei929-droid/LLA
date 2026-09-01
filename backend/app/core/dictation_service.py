@@ -5,7 +5,7 @@ from dataclasses import asdict
 from uuid import uuid4
 
 from app.core.dictation import DictationErrorType, evaluate_dictation, normalize_for_match
-from app.core.states import TransitionError
+from app.core.states import MaterialState, TransitionError, next_material_state
 from app.db.connection import Database
 
 
@@ -38,25 +38,31 @@ class DictationService:
             if current_state not in {"DICTATION_PART_1", "DICTATION_PART_2", "DICTATION_PART_3"}:
                 raise TransitionError("Dictation context is only available while a dictation Part is unlocked")
             part_no = int(current_state.rsplit("_", 1)[1])
-            rows = connection.execute(
-                """
-                SELECT s.sentence_id, s.part_no, s.sequence_no, s.start_time, s.end_time,
-                       EXISTS(
-                           SELECT 1 FROM dictation_attempts a
-                            WHERE a.sentence_id = s.sentence_id AND a.is_exact_match = 1
-                       ) AS is_exact
-                  FROM sentences s
-                 WHERE s.material_id = ? AND s.part_no = ?
-                 ORDER BY s.sequence_no
-                """,
-                (material_id, part_no),
-            ).fetchall()
+            return self._build_context(connection, material_id, current_state, part_no, progress)
+
+    @staticmethod
+    def _build_context(
+        connection, material_id: str, current_state: str, part_no: int, progress_row
+    ) -> dict[str, object]:
+        rows = connection.execute(
+            """
+            SELECT s.sentence_id, s.part_no, s.sequence_no, s.start_time, s.end_time,
+                   EXISTS(
+                       SELECT 1 FROM dictation_attempts a
+                        WHERE a.sentence_id = s.sentence_id AND a.is_exact_match = 1
+                   ) AS is_exact
+              FROM sentences s
+             WHERE s.material_id = ? AND s.part_no = ?
+             ORDER BY s.sequence_no
+            """,
+            (material_id, part_no),
+        ).fetchall()
         return {
             "material_id": material_id,
             "current_state": current_state,
             "part_no": part_no,
-            "current_sentence_id": progress["current_sentence_id"],
-            "current_attempt": progress["current_attempt"],
+            "current_sentence_id": progress_row["current_sentence_id"],
+            "current_attempt": progress_row["current_attempt"],
             "sentences": [dict(row) for row in rows],
         }
 
@@ -70,6 +76,7 @@ class DictationService:
         hint_level: int = 0,
         revealed: bool = False,
         memory_targets: list[str] | None = None,
+        operation_id: str | None = None,
     ) -> dict[str, object]:
         if listen_count < 1:
             raise ValueError("listen_count must be at least 1")
@@ -77,6 +84,12 @@ class DictationService:
             raise ValueError("hint_level must be between 0 and 2")
         memory_targets = [normalize_for_match(target) for target in (memory_targets or []) if target.strip()]
         with self.database.connect() as connection:
+            if operation_id:
+                cached = connection.execute(
+                    "SELECT result FROM dictation_operations WHERE operation_id = ?", (operation_id,)
+                ).fetchone()
+                if cached is not None:
+                    return json.loads(cached["result"])
             sentence = connection.execute(
                 "SELECT text FROM sentences WHERE material_id = ? AND sentence_id = ?",
                 (material_id, sentence_id),
@@ -173,15 +186,123 @@ class DictationService:
             )
             if updated.rowcount != 1:
                 raise TransitionError("Progress changed concurrently; reload before retrying")
+            fresh_progress = connection.execute(
+                "SELECT * FROM training_progress WHERE material_id = ?", (material_id,)
+            ).fetchone()
+            transition = self._resolve_transition(
+                connection=connection,
+                material_id=material_id,
+                current_part=current_part,
+                sentence_id=sentence_id,
+                is_exact=result.is_exact_match,
+                progress=fresh_progress,
+            )
+            result_payload = {
+                "sentence_id": sentence_id,
+                "attempt_number": attempt_number,
+                "listen_count": listen_count,
+                "is_exact_match": result.is_exact_match,
+                "errors": [asdict(error) for error in result.errors],
+                # The transcript is returned only after an explicit Reveal, so the
+                # blind-listening boundary stays on the server side.
+                "expected_text": sentence["text"] if revealed else None,
+                "completed_sentence": sentence_id if result.is_exact_match else None,
+                "transition_type": transition["type"],
+                "next_state": transition["next_state"],
+                "next_sentence_id": transition["next_sentence_id"],
+                "next_action": transition["next_action"],
+                "next_context": transition["next_context"],
+            }
+            # The idempotency ledger row is written in the same transaction as the
+            # attempt and Part transition, so a replayed operation_id observes the
+            # exact first-success payload without a duplicate attempt or transition.
+            if operation_id:
+                connection.execute(
+                    """
+                    INSERT INTO dictation_operations(operation_id, material_id, sentence_id, result, created_at)
+                    VALUES (?, ?, ?, ?, datetime('now'))
+                    """,
+                    (operation_id, material_id, sentence_id, json.dumps(result_payload, ensure_ascii=False)),
+                )
+        return result_payload
+
+    def _resolve_transition(
+        self, *, connection, material_id: str, current_part: int, sentence_id: str,
+        is_exact: bool, progress,
+    ) -> dict[str, object]:
+        """Compute the authoritative next step after a submit, and atomically
+        complete the Part when the submitted sentence was the last incomplete
+        one. Runs inside the submit transaction."""
+        if not is_exact:
+            return {
+                "type": "NONE",
+                "next_state": progress["current_state"],
+                "next_sentence_id": sentence_id,
+                "next_action": "RETRY",
+                "next_context": None,
+            }
+        incomplete = connection.execute(
+            """
+            SELECT s.sentence_id
+              FROM sentences s
+             WHERE s.material_id = ? AND s.part_no = ?
+               AND NOT EXISTS (
+                   SELECT 1 FROM dictation_attempts a
+                    WHERE a.sentence_id = s.sentence_id AND a.is_exact_match = 1
+               )
+             ORDER BY s.sequence_no
+             LIMIT 1
+            """,
+            (material_id, current_part),
+        ).fetchone()
+        if incomplete is not None:
+            return {
+                "type": "NEXT_SENTENCE",
+                "next_state": progress["current_state"],
+                "next_sentence_id": incomplete["sentence_id"],
+                "next_action": "CONTINUE_DICTATION",
+                "next_context": self._build_context(
+                    connection, material_id, progress["current_state"], current_part, progress
+                ),
+            }
+        # Part completed: perform the Part transition in the same transaction.
+        next_state = next_material_state(
+            MaterialState(progress["current_state"]), f"dictation_part_{current_part}_completed"
+        )
+        dictation_status = json.loads(progress["dictation_part_status"])
+        dictation_status[str(current_part)] = True
+        updated = connection.execute(
+            """
+            UPDATE training_progress
+               SET current_state = ?, dictation_part_status = ?, updated_at = datetime('now'), version = version + 1
+             WHERE material_id = ? AND version = ?
+            """,
+            (next_state.value, json.dumps(dictation_status, sort_keys=True), material_id, progress["version"]),
+        )
+        if updated.rowcount != 1:
+            raise TransitionError("Progress changed concurrently; reload before retrying")
+        if next_state in (MaterialState.DICTATION_PART_2, MaterialState.DICTATION_PART_3):
+            next_part = int(next_state.value.rsplit("_", 1)[1])
+            next_progress = connection.execute(
+                "SELECT * FROM training_progress WHERE material_id = ?", (material_id,)
+            ).fetchone()
+            next_context = self._build_context(
+                connection, material_id, next_state.value, next_part, next_progress
+            )
+            next_sentence = next((s for s in next_context["sentences"] if not s["is_exact"]), None)
+            return {
+                "type": "PART_COMPLETED",
+                "next_state": next_state.value,
+                "next_sentence_id": next_sentence["sentence_id"] if next_sentence else None,
+                "next_action": "CONTINUE_DICTATION",
+                "next_context": next_context,
+            }
         return {
-            "sentence_id": sentence_id,
-            "attempt_number": attempt_number,
-            "listen_count": listen_count,
-            "is_exact_match": result.is_exact_match,
-            "errors": [asdict(error) for error in result.errors],
-            # The transcript is returned only after an explicit Reveal, so the
-            # blind-listening boundary stays on the server side.
-            "expected_text": sentence["text"] if revealed else None,
+            "type": "PART_COMPLETED",
+            "next_state": next_state.value,
+            "next_sentence_id": None,
+            "next_action": "SECOND_LISTEN",
+            "next_context": None,
         }
 
     @staticmethod
