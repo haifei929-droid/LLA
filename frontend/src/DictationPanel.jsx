@@ -33,6 +33,9 @@ function DictationPanel({ materialId, context, onAdvance, onPartComplete, onMess
   const [hintLevel, setHintLevel] = useState(0)
   const [revealedText, setRevealedText] = useState(null)
   const [submitting, setSubmitting] = useState(false)
+  const [partSubmitting, setPartSubmitting] = useState(false)
+  const submittingRef = useRef(false)
+  const partSubmittingRef = useRef(false)
   const audioRef = useRef(null)
 
   const { sentences, part_no: partNo } = context
@@ -52,11 +55,27 @@ function DictationPanel({ materialId, context, onAdvance, onPartComplete, onMess
     }
   }, [result, onAdvance, onMessage])
 
+  const completePart = async () => {
+    if (partSubmittingRef.current) return
+    partSubmittingRef.current = true
+    setPartSubmitting(true)
+    try {
+      await onPartComplete()
+    } catch {
+      // 失败信息已由 onPartComplete 内层 setMessage 展示；这里仅恢复按钮可重试
+    } finally {
+      partSubmittingRef.current = false
+      setPartSubmitting(false)
+    }
+  }
+
   if (!current) {
     return (
       <div className="dictation-panel">
         <p className="notice">Part {partNo} 的所有句子都已逐字正确。</p>
-        <button className="primary" onClick={onPartComplete}>完成 Part {partNo}，进入下一步</button>
+        <button className="primary" onClick={completePart} disabled={partSubmitting}>
+          完成 Part {partNo}，进入下一步
+        </button>
       </div>
     )
   }
@@ -77,7 +96,8 @@ function DictationPanel({ materialId, context, onAdvance, onPartComplete, onMess
   }
 
   const submit = (revealed) => {
-    if (submitting) return
+    if (submittingRef.current) return
+    submittingRef.current = true
     setSubmitting(true)
     fetch(`/api/materials/${materialId}/sentences/${current.sentence_id}/dictation`, {
       method: 'POST',
@@ -101,7 +121,10 @@ function DictationPanel({ materialId, context, onAdvance, onPartComplete, onMess
         }
       })
       .catch((error) => onMessage(error.message))
-      .finally(() => setSubmitting(false))
+      .finally(() => {
+        submittingRef.current = false
+        setSubmitting(false)
+      })
   }
 
   const giveHint = () => {

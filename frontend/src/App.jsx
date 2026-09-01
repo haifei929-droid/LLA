@@ -61,6 +61,7 @@ function App() {
   const [comprehension, setComprehension] = useState({ rating: '30–50%', summary: '' })
   const [dictationContext, setDictationContext] = useState(null)
   const [dictationLoading, setDictationLoading] = useState(false)
+  const [dictationError, setDictationError] = useState(false)
   const [firstListenPlayed, setFirstListenPlayed] = useState(false)
   const [loading, setLoading] = useState(true)
   const [homeError, setHomeError] = useState('')
@@ -152,6 +153,7 @@ function App() {
   const refreshDictationContext = () => {
     if (!selected || !selected.current_state?.startsWith('DICTATION_PART_')) return
     setDictationLoading(true)
+    setDictationError(false)
     fetch(`/api/materials/${selected.material_id}/dictation-context`)
       .then(async (response) => {
         const payload = await response.json()
@@ -165,6 +167,7 @@ function App() {
       .catch((error) => {
         setMessage(error.message)
         setDictationLoading(false)
+        setDictationError(true)
       })
   }
 
@@ -248,6 +251,12 @@ function App() {
     }
     if (state.startsWith('DICTATION_PART_')) {
       if (dictationLoading) return <p className="muted">正在加载听写上下文…</p>
+      if (dictationError) {
+        return <div className="event-panel">
+          <p className="muted">听写上下文刷新失败，可重试。</p>
+          <button className="primary" onClick={refreshDictationContext}>重新加载上下文</button>
+        </div>
+      }
       if (!dictationContext) {
         return <div className="event-panel">
           <p className="muted">听写上下文加载失败，可重试。</p>
@@ -260,7 +269,7 @@ function App() {
         onAdvance={refreshDictationContext}
         onPartComplete={() => {
           const part = Number(state.slice(-1))
-          fetch(`/api/materials/${selected.material_id}/dictation-parts/${part}/complete`, { method: 'POST' })
+          return fetch(`/api/materials/${selected.material_id}/dictation-parts/${part}/complete`, { method: 'POST' })
             .then(async (response) => {
               const payload = await response.json()
               if (!response.ok) throw new Error(payload.detail || 'Part 完成失败')
@@ -272,7 +281,10 @@ function App() {
               refresh().catch(() => {})
               setMessage('Part 完成，进入下一步。')
             })
-            .catch((error) => setMessage(error.message))
+            .catch((error) => {
+              setMessage(error.message)
+              throw error
+            })
         }}
         onMessage={setMessage}
       />

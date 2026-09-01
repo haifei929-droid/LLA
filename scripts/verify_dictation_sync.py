@@ -1,5 +1,6 @@
 import json
 import os
+import sqlite3
 import subprocess
 import tempfile
 import time
@@ -35,8 +36,9 @@ def api(method, path, payload=None):
 
 def main():
     tmpdir = Path(tempfile.mkdtemp(prefix="lla-dict-e2e-"))
+    db_path = tmpdir / "e2e.sqlite3"
     env = dict(os.environ)
-    env["LTA_DATABASE_PATH"] = str(tmpdir / "e2e.sqlite3")
+    env["LTA_DATABASE_PATH"] = str(db_path)
     proc = subprocess.Popen(
         [VENV_PY, "-m", "uvicorn", "app.main:app", "--app-dir", "backend",
          "--host", "127.0.0.1", "--port", "8002"],
@@ -46,7 +48,6 @@ def main():
     try:
         time.sleep(4)
 
-        # Seed a 9-sentence material and advance to DICTATION_PART_1.
         api("POST", "/api/materials", {
             "material_id": "dict-001",
             "title": "Dictation sync material",
@@ -61,34 +62,73 @@ def main():
         api("POST", "/api/materials/dict-001/comprehension-check",
             {"phase": "FIRST", "self_rating": "50\u201370%", "summary": "ok"})
 
+        def attempt_count(sentence_index):
+            conn = sqlite3.connect(db_path)
+            n = conn.execute(
+                "SELECT COUNT(*) FROM dictation_attempts WHERE sentence_id = ?",
+                (f"dict-001-sentence-{sentence_index:03d}",),
+            ).fetchone()[0]
+            conn.close()
+            return n
+
         with sync_playwright() as p:
             browser = p.chromium.launch()
             page = browser.new_page(viewport={"width": 1280, "height": 900})
             page.goto(BASE, wait_until="networkidle")
-            # Open the material from the homepage hero.
             page.locator(".training-hero .primary").click()
             page.wait_for_selector(".dictation-panel", timeout=8000)
 
-            for idx in range(3):  # Part 1 has sentences 1..3
-                # Play once to unlock input (listenCount >= 1).
-                page.locator("text=播放本句").click()
-                textarea = page.locator(".dictation-input")
-                textarea.fill(SENTENCES[idx])
-                page.locator("button:has-text('提交')").click()
-                if idx < 2:
-                    # Wait until the context re-fetch marks sentence idx+1 exact.
-                    page.wait_for_function(
-                        "() => document.querySelector('.dictation-progress')?.textContent.includes('已正确 %d / 3')" % (idx + 1),
-                        timeout=8000,
-                    )
-                    progress = page.locator(".dictation-progress").inner_text()
-                    print(f"after sentence {idx+1}: {progress!r}")
-                    assert f"/ 3" in progress, "progress should stay on Part 1"
+            # 验证 A：快速连点不产生重复 Sentence completion
+            page.locator("text=播放本句").click()
+            page.locator(".dictation-input").fill(SENTENCES[0])
+            page.evaluate("""() => {
+              const btn = [...document.querySelectorAll('button')].find(b => b.textContent.trim() === '提交')
+              btn.click(); btn.click();
+            }""")
+            page.wait_for_function(
+                "() => document.querySelector('.dictation-progress')?.textContent.includes('已正确 1 / 3')",
+                timeout=8000,
+            )
+            a1 = attempt_count(1)
+            print(f"验证A 句1 attempt 数 = {a1}（期望 1）")
+            assert a1 == 1, "快速连点产生了重复 Sentence completion"
+
+            # 验证 B：refetch 失败 → 显式 Retry UI → 点击恢复
+            fail_next = {"on": True}
+
+            def handle_route(route):
+                if fail_next["on"]:
+                    fail_next["on"] = False
+                    route.fulfill(status=500, content_type="application/json",
+                                  body='{"detail":"simulated failure"}')
                 else:
-                    # Final sentence of the Part -> completion button, not loading.
-                    page.wait_for_selector("button:has-text('完成 Part')", timeout=8000)
-                    print("after sentence 3: completion button present")
-                    print("no permanent loading:", page.locator("text=正在加载听写上下文").count() == 0)
+                    route.continue_()
+
+            page.route("**/dictation-context", handle_route)
+            page.locator("text=播放本句").click()
+            page.locator(".dictation-input").fill(SENTENCES[1])
+            page.locator("button:has-text('提交')").click()
+            page.wait_for_selector("button:has-text('重新加载上下文')", timeout=8000)
+            print("验证B refetch 失败 → Retry UI 出现")
+            page.locator("button:has-text('重新加载上下文')").click()
+            page.wait_for_function(
+                "() => document.querySelector('.dictation-progress')?.textContent.includes('已正确 2 / 3')",
+                timeout=8000,
+            )
+            print("验证B 点击 Retry 后恢复（已正确 2 / 3）")
+
+            # 验证 C：最后一句完成 → Part completion → 进入 Part 2
+            page.locator("text=播放本句").click()
+            page.locator(".dictation-input").fill(SENTENCES[2])
+            page.locator("button:has-text('提交')").click()
+            page.wait_for_selector("button:has-text('完成 Part')", timeout=8000)
+            print("验证C 句3完成 → 出现「完成 Part」按钮")
+            page.locator("button:has-text('完成 Part')").click()
+            page.wait_for_function(
+                "() => document.querySelector('.dictation-progress')?.textContent.includes('Part 2')",
+                timeout=8000,
+            )
+            print("验证C 点击「完成 Part」→ 进入 Part 2，无永久 loading")
 
             browser.close()
     finally:
