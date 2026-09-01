@@ -60,6 +60,7 @@ function App() {
   const [message, setMessage] = useState('')
   const [comprehension, setComprehension] = useState({ rating: '30–50%', summary: '' })
   const [dictationContext, setDictationContext] = useState(null)
+  const [dictationLoading, setDictationLoading] = useState(false)
   const [firstListenPlayed, setFirstListenPlayed] = useState(false)
   const [loading, setLoading] = useState(true)
   const [homeError, setHomeError] = useState('')
@@ -150,14 +151,21 @@ function App() {
 
   const refreshDictationContext = () => {
     if (!selected || !selected.current_state?.startsWith('DICTATION_PART_')) return
+    setDictationLoading(true)
     fetch(`/api/materials/${selected.material_id}/dictation-context`)
       .then(async (response) => {
         const payload = await response.json()
         if (!response.ok) throw new Error(payload.detail || '无法加载听写上下文')
         return payload
       })
-      .then(setDictationContext)
-      .catch((error) => setMessage(error.message))
+      .then((context) => {
+        setDictationContext(context)
+        setDictationLoading(false)
+      })
+      .catch((error) => {
+        setMessage(error.message)
+        setDictationLoading(false)
+      })
   }
 
   useEffect(() => {
@@ -239,14 +247,32 @@ function App() {
       </form>
     }
     if (state.startsWith('DICTATION_PART_')) {
-      if (!dictationContext) return <p className="muted">正在加载听写上下文…</p>
+      if (dictationLoading) return <p className="muted">正在加载听写上下文…</p>
+      if (!dictationContext) {
+        return <div className="event-panel">
+          <p className="muted">听写上下文加载失败，可重试。</p>
+          <button className="primary" onClick={refreshDictationContext}>重新加载</button>
+        </div>
+      }
       return <DictationPanel
         materialId={selected.material_id}
         context={dictationContext}
+        onAdvance={refreshDictationContext}
         onPartComplete={() => {
           const part = Number(state.slice(-1))
-          postTrainingEvent(`/api/materials/${selected.material_id}/dictation-parts/${part}/complete`)
-          setDictationContext(null)
+          fetch(`/api/materials/${selected.material_id}/dictation-parts/${part}/complete`, { method: 'POST' })
+            .then(async (response) => {
+              const payload = await response.json()
+              if (!response.ok) throw new Error(payload.detail || 'Part 完成失败')
+              return payload
+            })
+            .then((progress) => {
+              setSelected((current) => current ? { ...current, ...progress } : current)
+              setDictationContext(null)
+              refresh().catch(() => {})
+              setMessage('Part 完成，进入下一步。')
+            })
+            .catch((error) => setMessage(error.message))
         }}
         onMessage={setMessage}
       />

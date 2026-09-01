@@ -26,12 +26,13 @@ function errorClass(errorType) {
   }[errorType] || 'err-blank'
 }
 
-function DictationPanel({ materialId, context, onPartComplete, onMessage }) {
+function DictationPanel({ materialId, context, onAdvance, onPartComplete, onMessage }) {
   const [input, setInput] = useState('')
   const [listenCount, setListenCount] = useState(0)
   const [result, setResult] = useState(null)
   const [hintLevel, setHintLevel] = useState(0)
   const [revealedText, setRevealedText] = useState(null)
+  const [submitting, setSubmitting] = useState(false)
   const audioRef = useRef(null)
 
   const { sentences, part_no: partNo } = context
@@ -47,9 +48,9 @@ function DictationPanel({ materialId, context, onPartComplete, onMessage }) {
       setResult(null)
       setHintLevel(0)
       setRevealedText(null)
-      onPartComplete() // refresh context via parent
+      onAdvance() // 普通句完成：重新读取 context，进入下一句
     }
-  }, [result, onPartComplete, onMessage])
+  }, [result, onAdvance, onMessage])
 
   if (!current) {
     return (
@@ -76,6 +77,8 @@ function DictationPanel({ materialId, context, onPartComplete, onMessage }) {
   }
 
   const submit = (revealed) => {
+    if (submitting) return
+    setSubmitting(true)
     fetch(`/api/materials/${materialId}/sentences/${current.sentence_id}/dictation`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -98,6 +101,7 @@ function DictationPanel({ materialId, context, onPartComplete, onMessage }) {
         }
       })
       .catch((error) => onMessage(error.message))
+      .finally(() => setSubmitting(false))
   }
 
   const giveHint = () => {
@@ -150,7 +154,7 @@ function DictationPanel({ materialId, context, onPartComplete, onMessage }) {
       />
       <div className="dictation-actions">
         <button className="secondary" onClick={insertBlank}>这里没听出来 ____</button>
-        <button className="primary" onClick={() => submit(false)} disabled={listenCount < 1}>提交</button>
+        <button className="primary" onClick={() => submit(false)} disabled={listenCount < 1 || submitting}>提交</button>
       </div>
 
       {result && !result.is_exact_match && !revealedText && (
@@ -168,7 +172,7 @@ function DictationPanel({ materialId, context, onPartComplete, onMessage }) {
             <button className="secondary" onClick={giveHint} disabled={hintLevel >= 2}>
               {HINT_LABELS[hintLevel + 1] || '再听一遍'}
             </button>
-            <button className="danger" onClick={() => submit(true)}>Reveal 原文</button>
+            <button className="danger" onClick={() => submit(true)} disabled={submitting}>Reveal 原文</button>
           </div>
         </div>
       )}
@@ -179,7 +183,7 @@ function DictationPanel({ materialId, context, onPartComplete, onMessage }) {
           <blockquote>{revealedText}</blockquote>
           <div className="dictation-actions">
             <button className="secondary" onClick={skipAfterReveal}>清空重写</button>
-            <button className="primary" onClick={() => submit(false)} disabled={listenCount < 1}>提交本句</button>
+            <button className="primary" onClick={() => submit(false)} disabled={listenCount < 1 || submitting}>提交本句</button>
           </div>
         </div>
       )}
