@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
 
 from app.config import Settings
+from app.core.dictation import normalize_for_match
 
 
 SCHEMA_PATH = __file__.replace("connection.py", "schema.sql")
@@ -37,6 +39,7 @@ class Database:
             connection.execute(
                 "ALTER TABLE dictation_operations ADD COLUMN normalized_text TEXT NOT NULL DEFAULT ''"
             )
+        Database._backfill_operation_identity(connection)
         material_columns = {row["name"] for row in connection.execute("PRAGMA table_info(materials)")}
         if "source_url" not in material_columns:
             connection.execute("ALTER TABLE materials ADD COLUMN source_url TEXT")
@@ -47,6 +50,42 @@ class Database:
         ):
             if column not in material_columns:
                 connection.execute(f"ALTER TABLE materials ADD COLUMN {column} {definition}")
+
+    @staticmethod
+    def _backfill_operation_identity(connection: sqlite3.Connection) -> None:
+        """Recover `normalized_text` for operations written before the column
+        existed.
+
+        The first submit's request identity is reconstructable from the attempt
+        that submit produced: `result.attempt_number` + `sentence_id` uniquely
+        identify the `dictation_attempts` row, whose `user_text` is normalized
+        with the same `normalize_for_match` semantics the submit path uses.
+        Rows that cannot be reconstructed (missing attempt) are left with the
+        empty sentinel rather than fabricated, and re-running the backfill only
+        touches still-empty rows, so it is idempotent.
+        """
+        rows = connection.execute(
+            "SELECT operation_id, result FROM dictation_operations WHERE normalized_text = ''"
+        ).fetchall()
+        for row in rows:
+            try:
+                result = json.loads(row["result"])
+            except (ValueError, TypeError):
+                continue
+            sentence_id = result.get("sentence_id")
+            attempt_number = result.get("attempt_number")
+            if sentence_id is None or attempt_number is None:
+                continue
+            attempt = connection.execute(
+                "SELECT user_text FROM dictation_attempts WHERE sentence_id = ? AND attempt_number = ?",
+                (sentence_id, attempt_number),
+            ).fetchone()
+            if attempt is None:
+                continue
+            connection.execute(
+                "UPDATE dictation_operations SET normalized_text = ? WHERE operation_id = ?",
+                (normalize_for_match(attempt["user_text"]), row["operation_id"]),
+            )
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
