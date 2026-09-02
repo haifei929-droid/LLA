@@ -50,7 +50,11 @@ class DictationService:
                    EXISTS(
                        SELECT 1 FROM dictation_attempts a
                         WHERE a.sentence_id = s.sentence_id AND a.is_exact_match = 1
-                   ) AS is_exact
+                   ) AS is_exact,
+                   COALESCE((
+                       SELECT MAX(a.listen_count) FROM dictation_attempts a
+                        WHERE a.sentence_id = s.sentence_id
+                   ), 0) AS listen_count
               FROM sentences s
              WHERE s.material_id = ? AND s.part_no = ?
              ORDER BY s.sequence_no
@@ -76,20 +80,35 @@ class DictationService:
         hint_level: int = 0,
         revealed: bool = False,
         memory_targets: list[str] | None = None,
-        operation_id: str | None = None,
+        operation_id: str,
     ) -> dict[str, object]:
         if listen_count < 1:
             raise ValueError("listen_count must be at least 1")
         if hint_level not in (0, 1, 2):
             raise ValueError("hint_level must be between 0 and 2")
+        if not operation_id or not operation_id.strip():
+            raise ValueError("operation_id is required")
         memory_targets = [normalize_for_match(target) for target in (memory_targets or []) if target.strip()]
+        normalized_text = normalize_for_match(user_text)
         with self.database.connect() as connection:
-            if operation_id:
-                cached = connection.execute(
-                    "SELECT result FROM dictation_operations WHERE operation_id = ?", (operation_id,)
-                ).fetchone()
-                if cached is not None:
-                    return json.loads(cached["result"])
+            cached = connection.execute(
+                """
+                SELECT material_id, sentence_id, normalized_text, result
+                  FROM dictation_operations
+                 WHERE operation_id = ?
+                """,
+                (operation_id,),
+            ).fetchone()
+            if cached is not None:
+                if (
+                    cached["material_id"] != material_id
+                    or cached["sentence_id"] != sentence_id
+                    or cached["normalized_text"] != normalized_text
+                ):
+                    raise ValueError(
+                        "Idempotency conflict: operation_id was already used with different request semantics"
+                    )
+                return json.loads(cached["result"])
             sentence = connection.execute(
                 "SELECT text FROM sentences WHERE material_id = ? AND sentence_id = ?",
                 (material_id, sentence_id),
@@ -219,10 +238,10 @@ class DictationService:
             if operation_id:
                 connection.execute(
                     """
-                    INSERT INTO dictation_operations(operation_id, material_id, sentence_id, result, created_at)
-                    VALUES (?, ?, ?, ?, datetime('now'))
+                    INSERT INTO dictation_operations(operation_id, material_id, sentence_id, normalized_text, result, created_at)
+                    VALUES (?, ?, ?, ?, ?, datetime('now'))
                     """,
-                    (operation_id, material_id, sentence_id, json.dumps(result_payload, ensure_ascii=False)),
+                    (operation_id, material_id, sentence_id, normalized_text, json.dumps(result_payload, ensure_ascii=False)),
                 )
         return result_payload
 

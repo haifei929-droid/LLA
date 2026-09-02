@@ -171,7 +171,7 @@ def test_f3_failed_material_is_gated_from_training(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="not ready"):
         DictationService(database).submit(
             material_id=material_id, sentence_id=f"{material_id}-sentence-001",
-            user_text="x", listen_count=1,
+            user_text="x", listen_count=1, operation_id="op-gate",
         )
 
     original_settings = main_module.settings

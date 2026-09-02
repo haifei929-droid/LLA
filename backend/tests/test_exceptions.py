@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
@@ -64,6 +65,7 @@ def test_failed_analysis_never_marks_pass_and_keeps_recording(tmp_path: Path) ->
                 sentence_id=f"{material_id}-sentence-{index + 1:03d}",
                 user_text=DEFAULT_SENTENCES[index],
                 listen_count=1,
+                operation_id=f"op-{uuid4().hex}",
             )
     # The final sentence of each Part completes it atomically inside submit.
     events.complete_second_listen(material_id)

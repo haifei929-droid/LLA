@@ -8,6 +8,7 @@ text is returned solely after an explicit Reveal.
 from __future__ import annotations
 
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
@@ -68,7 +69,7 @@ def test_dictation_context_has_no_text_and_marks_exact(client: TestClient) -> No
 
     submitted = client.post(
         f"/api/materials/ctx-m1/sentences/{first_id}/dictation",
-        json={"user_text": DEFAULT_SENTENCES[0], "listen_count": 1},
+        json={"user_text": DEFAULT_SENTENCES[0], "listen_count": 1, "operation_id": f"op-{uuid4().hex}"},
     )
     assert submitted.status_code == 200
     assert submitted.json()["expected_text"] is None
@@ -94,7 +95,7 @@ def test_reveal_returns_transcript_and_never_marks_correct(client: TestClient) -
 
     revealed = client.post(
         f"/api/materials/ctx-m1/sentences/{first_id}/dictation",
-        json={"user_text": "", "listen_count": 3, "revealed": True},
+        json={"user_text": "", "listen_count": 3, "revealed": True, "operation_id": f"op-{uuid4().hex}"},
     )
     assert revealed.status_code == 200
     payload = revealed.json()
@@ -103,3 +104,18 @@ def test_reveal_returns_transcript_and_never_marks_correct(client: TestClient) -
 
     refreshed = client.get("/api/materials/ctx-m1/dictation-context").json()
     assert not refreshed["sentences"][0]["is_exact"]
+
+
+def test_missing_operation_id_returns_422(client: TestClient) -> None:
+    _create(client)
+    _drive(client, "ctx-m1")
+    context = client.get("/api/materials/ctx-m1/dictation-context").json()
+    first_id = context["sentences"][0]["sentence_id"]
+
+    response = client.post(
+        f"/api/materials/ctx-m1/sentences/{first_id}/dictation",
+        json={"user_text": DEFAULT_SENTENCES[0], "listen_count": 1},
+    )
+    assert response.status_code == 422
+    refreshed = client.get("/api/materials/ctx-m1/dictation-context").json()
+    assert refreshed["sentences"][0]["is_exact"] == 0

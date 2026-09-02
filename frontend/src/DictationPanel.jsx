@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 
 // Hint formats are a Spec "待校准" item; these minimal placeholders only
 // reveal position and length, never the word itself.
@@ -42,11 +42,19 @@ function DictationPanel({ materialId, context, onTransition, onPartComplete, onM
   const [partSubmitting, setPartSubmitting] = useState(false)
   const submittingRef = useRef(false)
   const partSubmittingRef = useRef(false)
+  const pendingOpRef = useRef(null)
   const audioRef = useRef(null)
 
   const { sentences, part_no: partNo } = context
   const current = sentences.find((sentence) => !sentence.is_exact)
   const doneCount = sentences.filter((sentence) => sentence.is_exact).length
+
+  // 服务端恢复：进入新句时用后端返回的 listen_count 初始化，不覆盖服务端事实。
+  useEffect(() => {
+    if (current) {
+      setListenCount(current.listen_count || 0)
+    }
+  }, [current?.sentence_id])
 
   // Defensive/recovery path only: the normal flow completes a Part atomically
   // inside sentence submit, so this branch is only reached for legacy data
@@ -93,6 +101,10 @@ function DictationPanel({ materialId, context, onTransition, onPartComplete, onM
 
   const submit = (revealed) => {
     if (submittingRef.current) return
+    // 一次业务操作绑定一个稳定 operation_id：网络失败/response 丢失后 retry
+    // 复用同一 ID，只有收到明确终态（任意 HTTP response）才释放并生成下一个。
+    const opId = pendingOpRef.current ?? newOperationId()
+    pendingOpRef.current = opId
     submittingRef.current = true
     setSubmitting(true)
     fetch(`/api/materials/${materialId}/sentences/${current.sentence_id}/dictation`, {
@@ -103,11 +115,12 @@ function DictationPanel({ materialId, context, onTransition, onPartComplete, onM
         listen_count: listenCount,
         hint_level: revealed ? 0 : hintLevel,
         revealed,
-        operation_id: newOperationId(),
+        operation_id: opId,
       }),
     })
       .then(async (response) => {
         const payload = await response.json()
+        pendingOpRef.current = null // 收到 HTTP response 即明确终态，释放 operation_id
         if (!response.ok) throw new Error(payload.detail || '提交失败')
         return payload
       })

@@ -27,8 +27,8 @@ class DictationSubmitRequest(BaseModel):
     revealed: bool = False
     memory_targets: list[str] = Field(default_factory=list)
     #: Client-generated idempotency key; replayed requests return the first
-    #: success result without a duplicate attempt or Part transition.
-    operation_id: str | None = None
+    #: success result without a duplicate attempt or Part transition. Required.
+    operation_id: str = Field(min_length=1)
 
 
 class ComprehensionCheckRequest(BaseModel):

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import threading
 from pathlib import Path
+from uuid import uuid4
 
 from fastapi.testclient import TestClient
 
@@ -30,7 +31,7 @@ def test_concurrent_dictation_submits_never_500(tmp_path: Path) -> None:
         # violation -> 500) or a lost progress update.
         response = client.post(
             "/api/materials/m1/sentences/m1-sentence-001/dictation",
-            json={"user_text": "wrong wrong wrong", "listen_count": 1},
+            json={"user_text": "wrong wrong wrong", "listen_count": 1, "operation_id": f"op-{uuid4().hex}"},
         )
         with lock:
             results.append(response.status_code)
@@ -83,7 +84,7 @@ def test_progress_version_bump_is_traceable(tmp_path: Path) -> None:
         with TestClient(main_module.app) as client:
             response = client.post(
                 "/api/materials/m1/sentences/m1-sentence-001/dictation",
-                json={"user_text": DEFAULT_SENTENCES[0], "listen_count": 1},
+                json={"user_text": DEFAULT_SENTENCES[0], "listen_count": 1, "operation_id": f"op-{uuid4().hex}"},
             )
             assert response.status_code == 200, response.text
     finally:

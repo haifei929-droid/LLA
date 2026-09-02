@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
@@ -47,10 +48,10 @@ def client(tmp_path: Path):
         main_module.settings = original_settings
 
 
-def _dictate(client: TestClient, material_id: str, sentence_no: int, text: str, listen_count: int = 1):
+def _dictate(client: TestClient, material_id: str, sentence_no: int, text: str, listen_count: int = 1, operation_id: str | None = None):
     return client.post(
         f"/api/materials/{material_id}/sentences/{material_id}-sentence-{sentence_no:03d}/dictation",
-        json={"user_text": text, "listen_count": listen_count},
+        json={"user_text": text, "listen_count": listen_count, "operation_id": operation_id or f"op-{uuid4().hex}"},
     )
 
 

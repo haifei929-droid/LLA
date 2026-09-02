@@ -74,6 +74,7 @@ CREATE TABLE IF NOT EXISTS dictation_operations (
     operation_id TEXT PRIMARY KEY,
     material_id TEXT NOT NULL,
     sentence_id TEXT NOT NULL,
+    normalized_text TEXT NOT NULL,
     result TEXT NOT NULL,
     created_at TEXT NOT NULL
 );

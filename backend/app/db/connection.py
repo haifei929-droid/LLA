@@ -32,6 +32,11 @@ class Database:
             connection.execute(
                 "ALTER TABLE dictation_attempts ADD COLUMN memory_targets TEXT NOT NULL DEFAULT '[]'"
             )
+        operation_columns = {row["name"] for row in connection.execute("PRAGMA table_info(dictation_operations)")}
+        if "normalized_text" not in operation_columns:
+            connection.execute(
+                "ALTER TABLE dictation_operations ADD COLUMN normalized_text TEXT NOT NULL DEFAULT ''"
+            )
         material_columns = {row["name"] for row in connection.execute("PRAGMA table_info(materials)")}
         if "source_url" not in material_columns:
             connection.execute("ALTER TABLE materials ADD COLUMN source_url TEXT")

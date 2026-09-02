@@ -11,6 +11,7 @@ Maps to Spec 31.1 (listening path) plus the state guards fixed in M0:
 from __future__ import annotations
 
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
@@ -47,11 +48,11 @@ def _create_material(client: TestClient, material_id: str = "acc-m1") -> None:
     assert response.status_code == 201, response.text
 
 
-def _dictate(client: TestClient, material_id: str, sentence_no: int, text: str, listen_count: int = 1):
+def _dictate(client: TestClient, material_id: str, sentence_no: int, text: str, listen_count: int = 1, operation_id: str | None = None):
     sentence_id = f"{material_id}-sentence-{sentence_no:03d}"
     return client.post(
         f"/api/materials/{material_id}/sentences/{sentence_id}/dictation",
-        json={"user_text": text, "listen_count": listen_count},
+        json={"user_text": text, "listen_count": listen_count, "operation_id": operation_id or f"op-{uuid4().hex}"},
     )
 
 

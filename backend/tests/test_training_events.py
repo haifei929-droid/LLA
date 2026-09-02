@@ -1,4 +1,5 @@
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 
@@ -58,7 +59,8 @@ def test_training_event_service_reaches_full_completion(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="order"):
         dictation.submit(
-            material_id="m1", sentence_id=sentence_ids[1], user_text="Sentence 2.", listen_count=1
+            material_id="m1", sentence_id=sentence_ids[1], user_text="Sentence 2.", listen_count=1,
+            operation_id=f"op-{uuid4().hex}",
         )
     with pytest.raises(TransitionError):
         events.complete_dictation_part("m1", 2)
@@ -67,13 +69,15 @@ def test_training_event_service_reaches_full_completion(tmp_path: Path) -> None:
     last = None
     for index, sentence_id in enumerate(sentence_ids[:3]):
         dictation.submit(
-            material_id="m1", sentence_id=sentence_id, user_text="wrong", listen_count=1
+            material_id="m1", sentence_id=sentence_id, user_text="wrong", listen_count=1,
+            operation_id=f"op-{uuid4().hex}",
         )
         last = dictation.submit(
             material_id="m1",
             sentence_id=sentence_id,
             user_text=expected_texts[index],
             listen_count=2,
+            operation_id=f"op-{uuid4().hex}",
         )
     assert last["transition_type"] == "PART_COMPLETED"
     assert last["next_state"] == MaterialState.DICTATION_PART_2.value
@@ -86,6 +90,7 @@ def test_training_event_service_reaches_full_completion(tmp_path: Path) -> None:
                 sentence_id=sentence_ids[index],
                 user_text=f"Sentence {index + 1}.",
                 listen_count=1,
+                operation_id=f"op-{uuid4().hex}",
             )
         assert last["transition_type"] == "PART_COMPLETED"
 
@@ -115,5 +120,6 @@ def test_dictation_is_locked_until_first_comprehension(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="not available"):
         dictation.submit(
-            material_id="m1", sentence_id=sentence_ids[0], user_text="Sentence 1.", listen_count=1
+            material_id="m1", sentence_id=sentence_ids[0], user_text="Sentence 1.", listen_count=1,
+            operation_id=f"op-{uuid4().hex}",
         )

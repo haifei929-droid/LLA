@@ -83,7 +83,20 @@ def main():
             page.locator(".training-hero .primary").click()
             page.wait_for_selector(".dictation-panel", timeout=8000)
 
-            # 句 1：快速连点不产生重复 attempt（operation_id 幂等 + 前端 ref 守卫）
+            # 验证 listen_count 恢复：句1 听 2 遍 + 提交错误答案，刷新后恢复 2
+            page.locator("text=播放本句").click()
+            page.locator("text=播放本句").click()
+            page.locator(".dictation-input").fill("wrong wrong wrong")
+            page.locator("button:has-text('提交')").click()
+            page.wait_for_selector(".dictation-feedback", timeout=8000)
+            page.goto(BASE, wait_until="networkidle")
+            page.locator(".training-hero .primary").click()
+            page.wait_for_selector(".dictation-panel", timeout=8000)
+            count_text = page.locator(".listen-count").inner_text()
+            print(f"刷新后 listen-count 文本: {count_text!r}")
+            assert "2" in count_text, f"listen_count 未从服务端恢复: {count_text}"
+
+            # 句1：再听 1 遍（listenCount=3）+ 快速连点正确答案，attempt 只 +1
             page.locator("text=播放本句").click()
             page.locator(".dictation-input").fill(SENTENCES[0])
             page.evaluate("""() => {
@@ -94,10 +107,11 @@ def main():
                 "() => document.querySelector('.dictation-progress')?.textContent.includes('已正确 1 / 3')",
                 timeout=8000,
             )
-            print(f"句1 后 attempt 数 = {attempt_count(1)}（期望 1）")
-            assert attempt_count(1) == 1
+            a1 = attempt_count(1)
+            print(f"句1 attempt 数 = {a1}（期望 2：1 错误 + 1 正确，无重复）")
+            assert a1 == 2
 
-            # 句 2：普通句 → 服务端返回 next_context 直接渲染句 3
+            # 句2：普通句 → 服务端 next_context 直接渲染句3
             page.locator("text=播放本句").click()
             page.locator(".dictation-input").fill(SENTENCES[1])
             page.locator("button:has-text('提交')").click()
@@ -107,7 +121,7 @@ def main():
             )
             print("句2 后自动进入句3（已正确 2/3）")
 
-            # 句 3：末句 → 服务端原子完成 Part 1 → 直接进入 Part 2
+            # 句3：末句 → 服务端原子完成 Part 1 → 直接进入 Part 2
             page.locator("text=播放本句").click()
             page.locator(".dictation-input").fill(SENTENCES[2])
             page.locator("button:has-text('提交')").click()
@@ -117,7 +131,6 @@ def main():
             )
             print("句3 后原子进入 Part 2（无刷新、无完成 Part 按钮）")
 
-            # 主路径不应再调用 deprecated Part completion API
             assert not any("/dictation-parts/" in u for u in part_completion_calls), \
                 f"主路径调用了 Part completion API: {part_completion_calls}"
             print("主路径未调用 /dictation-parts/ API")

@@ -1,4 +1,5 @@
 from pathlib import Path
+from uuid import uuid4
 
 from app.config import Settings
 from app.core.dictation_service import DictationService
@@ -47,12 +48,14 @@ def test_material_and_dictation_services_persist_attempts(tmp_path: Path) -> Non
         user_text="One ____",
         listen_count=1,
         hint_level=1,
+        operation_id=f"op-{uuid4().hex}",
     )
     second = service.submit(
         material_id="m1",
         sentence_id=sentence_id,
         user_text="One sentence.",
         listen_count=2,
+        operation_id=f"op-{uuid4().hex}",
     )
 
     assert store.list()[0]["material_id"] == "m1"
@@ -82,6 +85,7 @@ def test_exact_first_attempt_does_not_create_listening_memory(tmp_path: Path) ->
         sentence_id=sentence_id,
         user_text="One sentence.",
         listen_count=1,
+        operation_id=f"op-{uuid4().hex}",
     )
 
     with database.connect() as connection:

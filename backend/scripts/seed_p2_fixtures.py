@@ -123,6 +123,7 @@ def main() -> None:
             material_id=material_id,
             sentence_id=f"{material_id}-sentence-{sentence_no:03d}",
             user_text=text, listen_count=listen_count, hint_level=hint, revealed=revealed,
+            operation_id=f"op-{uuid4().hex}",
         )
 
     def advance_part(material_id: str, part: int) -> None:

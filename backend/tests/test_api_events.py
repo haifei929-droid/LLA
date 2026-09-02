@@ -46,13 +46,13 @@ def test_event_api_drives_and_guards_first_dictation_part(tmp_path: Path) -> Non
 
             out_of_order = client.post(
                 "/api/materials/api-m1/sentences/api-m1-sentence-002/dictation",
-                json={"user_text": "Sentence 2.", "listen_count": 1},
+                json={"user_text": "Sentence 2.", "listen_count": 1, "operation_id": "op-o"},
             )
             assert out_of_order.status_code == 409
 
             first = client.post(
                 "/api/materials/api-m1/sentences/api-m1-sentence-001/dictation",
-                json={"user_text": "Sentence 1.", "listen_count": 1},
+                json={"user_text": "Sentence 1.", "listen_count": 1, "operation_id": "op-f"},
             )
             assert first.status_code == 200
             incomplete = client.post("/api/materials/api-m1/dictation-parts/1/complete")
