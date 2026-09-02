@@ -240,9 +240,9 @@ def test_f4_concurrent_duplicate_evaluation_never_500s(tmp_path: Path) -> None:
 
 # ------------------------- F5: ranking & audit -------------------------
 
-def test_f5_ranking_uses_all_four_dimensions() -> None:
-    database = make_database(Path(__file__).parent / "tmp-f5")
-    service = MaterialCandidateService(database, make_settings(Path(__file__).parent))
+def test_f5_ranking_uses_all_four_dimensions(tmp_path: Path) -> None:
+    database = make_database(tmp_path)
+    service = MaterialCandidateService(database, make_settings(tmp_path))
     candidates = [
         {"candidate_id": "a", "audio_quality": "Clear", "transcript_status": "COMPLETE", "duration_seconds": 110.0, "speech_rate_wpm": 140.0},
         {"candidate_id": "b", "audio_quality": "Clear", "transcript_status": "COMPLETE", "duration_seconds": 90.0, "speech_rate_wpm": 110.0},
