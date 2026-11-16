@@ -118,9 +118,16 @@ def align_sentences(sentences: list[str], segments: list[RecognizedSegment]) -> 
         if word_span is not None:
             start, end = time_of(word_span)
             if start >= previous_end - 0.5:
-                result[index] = (sentence, start, end)
-                previous_end = max(previous_end, end)
-                continue
+                # The tolerance handles small ASR/transcript drift, but the
+                # material contract still requires strictly ordered sentence
+                # intervals.  Clamp an accepted anchor to the prior end so a
+                # sub-frame float difference or a small overlap cannot leak
+                # into MaterialPreprocessor validation.
+                start = max(start, previous_end)
+                if end > start:
+                    result[index] = (sentence, start, end)
+                    previous_end = end
+                    continue
         pending.append((index, sentence, len(sentence.split())))
 
     # Second pass: interpolate unmatched sentences between their nearest
@@ -151,7 +158,22 @@ def align_sentences(sentences: list[str], segments: list[RecognizedSegment]) -> 
             span = max(0.15, budget * words / max(1, total_words))
             result[index] = (sentence, cursor, cursor + span)
             cursor += span
-    return [item for item in result if item is not None]  # type: ignore[misc]
+
+    # Interpolation keeps a minimum useful sentence span even when two ASR
+    # anchors leave almost no window.  Normalize the completed sequence once
+    # more so that this minimum cannot overlap the following anchor.
+    normalized: list[tuple[str, float, float]] = []
+    previous_end = 0.0
+    for item in result:
+        if item is None:
+            continue
+        sentence, start, end = item
+        start = max(start, previous_end)
+        if end <= start:
+            end = start + 0.15
+        normalized.append((sentence, start, end))
+        previous_end = end
+    return normalized
 
 
 def _fetch(url: str) -> str:

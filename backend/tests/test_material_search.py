@@ -64,6 +64,40 @@ def test_align_sentences_maps_to_segment_timestamps() -> None:
     assert aligned[2][1] == pytest.approx(6.5, abs=0.3)
 
 
+def test_align_sentences_clamps_small_anchor_overlap() -> None:
+    segments = [
+        RecognizedSegment(text="First sentence.", start_time=0.0, end_time=2.0),
+        RecognizedSegment(text="Second sentence.", start_time=1.8, end_time=4.0),
+    ]
+    aligned = align_sentences(
+        ["First sentence.", "Second sentence.", "A final sentence."],
+        segments,
+    )
+
+    assert all(
+        current[1] >= previous[2]
+        for previous, current in zip(aligned, aligned[1:])
+    )
+    assert all(sentence[2] > sentence[1] for sentence in aligned)
+
+
+def test_align_sentences_normalizes_minimum_interpolation_span() -> None:
+    segments = [
+        RecognizedSegment(text="First sentence.", start_time=0.0, end_time=2.0),
+        RecognizedSegment(text="Third sentence.", start_time=2.000000000000001, end_time=4.0),
+    ]
+    aligned = align_sentences(
+        ["First sentence.", "Second sentence.", "Third sentence."],
+        segments,
+    )
+
+    assert all(
+        current[1] >= previous[2]
+        for previous, current in zip(aligned, aligned[1:])
+    )
+    assert all(sentence[2] > sentence[1] for sentence in aligned)
+
+
 class FakeProvider:
     def __init__(self, tmp_path: Path, pass_quality: bool = True) -> None:
         self.called_with: dict[str, object] = {}
