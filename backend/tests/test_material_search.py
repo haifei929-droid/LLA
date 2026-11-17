@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from app.adapters.speech import RecognizedSegment
-from app.adapters.web_material import align_sentences, split_sentences
+from app.adapters.web_material import BBCLearningEnglishProvider, align_sentences, split_sentences
 from app.core.material_recommender import MaterialRecommender, SearchCriteria
 from app.core.material_search import MaterialSearchService
 from app.db.connection import Database
@@ -96,6 +96,38 @@ def test_align_sentences_normalizes_minimum_interpolation_span() -> None:
         for previous, current in zip(aligned, aligned[1:])
     )
     assert all(sentence[2] > sentence[1] for sentence in aligned)
+
+
+def test_bbc_provider_skips_episode_without_downloadable_audio(monkeypatch, tmp_path: Path) -> None:
+    provider = BBCLearningEnglishProvider()
+    bad_url = "https://www.bbc.co.uk/learningenglish/english/features/6-minute-english/ep-170622"
+    good_url = "https://www.bbc.co.uk/learningenglish/english/features/6-minute-english/ep-170623"
+    visited: list[str] = []
+
+    monkeypatch.setattr(provider, "_list_episode_urls", lambda: [bad_url, good_url])
+
+    def fetch_episode(url: str) -> tuple[str, str, str]:
+        visited.append(url)
+        if url == bad_url:
+            raise ValueError(f"Episode has no downloadable transcript/audio: {url}")
+        return "Usable episode", "One sentence. Two sentence. Three sentence.", "https://example.test/good.mp3"
+
+    def download(_url: str, path: Path) -> None:
+        path.write_bytes(b"mp3")
+
+    def transcode(args: list[str], check: bool) -> None:
+        Path(args[-1]).write_bytes(b"wav")
+
+    monkeypatch.setattr(provider, "_fetch_episode", fetch_episode)
+    monkeypatch.setattr("app.adapters.web_material.urllib.request.urlretrieve", download)
+    monkeypatch.setattr("app.adapters.web_material.subprocess.run", transcode)
+    monkeypatch.setattr("app.adapters.web_material._wav_duration", lambda _path: 60.0)
+
+    source = provider.search_next(exclude_urls=set(), work_dir=tmp_path, asr=None)
+
+    assert source.material_id == "web-6me-170623"
+    assert source.source_url == good_url
+    assert visited == [bad_url, good_url]
 
 
 class FakeProvider:

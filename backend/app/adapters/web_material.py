@@ -234,42 +234,52 @@ class BBCLearningEnglishProvider:
         episodes = [url for url in self._list_episode_urls() if url not in exclude_urls]
         if not episodes:
             raise ValueError("No unseen BBC 6 Minute English episodes available")
-        title, transcript, mp3_url = self._fetch_episode(episodes[0])
+        last_error: Exception | None = None
+        for episode_url in episodes:
+            try:
+                title, transcript, mp3_url = self._fetch_episode(episode_url)
 
-        episode_id = re.search(r"ep-(\d+)", episodes[0]).group(1)
-        material_id = f"web-6me-{episode_id}"
-        work_dir.mkdir(parents=True, exist_ok=True)
-        mp3_path = work_dir / f"{material_id}.mp3"
-        wav_path = work_dir / f"{material_id}.wav"
-        if not mp3_path.exists():
-            urllib.request.urlretrieve(mp3_url, mp3_path)
-        if not wav_path.exists():
-            subprocess.run(
-                ["ffmpeg", "-y", "-loglevel", "error", "-i", str(mp3_path),
-                 "-ac", "1", "-ar", "16000", "-sample_fmt", "s16", str(wav_path)],
-                check=True,
-            )
+                episode_id = re.search(r"ep-(\d+)", episode_url).group(1)
+                material_id = f"web-6me-{episode_id}"
+                work_dir.mkdir(parents=True, exist_ok=True)
+                mp3_path = work_dir / f"{material_id}.mp3"
+                wav_path = work_dir / f"{material_id}.wav"
+                if not mp3_path.exists():
+                    urllib.request.urlretrieve(mp3_url, mp3_path)
+                if not wav_path.exists():
+                    subprocess.run(
+                        ["ffmpeg", "-y", "-loglevel", "error", "-i", str(mp3_path),
+                         "-ac", "1", "-ar", "16000", "-sample_fmt", "s16", str(wav_path)],
+                        check=True,
+                    )
 
-        segments = []
-        if asr is not None:
-            segments = asr.transcribe(str(wav_path))
-        sentences = split_sentences(transcript)
-        if segments:
-            aligned = align_sentences(sentences, segments)
-        else:
-            # No ASR: word-proportional approximation over total duration.
-            aligned = _approximate_timestamps(sentences, _wav_duration(wav_path))
+                segments = []
+                if asr is not None:
+                    segments = asr.transcribe(str(wav_path))
+                sentences = split_sentences(transcript)
+                if segments:
+                    aligned = align_sentences(sentences, segments)
+                else:
+                    # No ASR: word-proportional approximation over total duration.
+                    aligned = _approximate_timestamps(sentences, _wav_duration(wav_path))
 
-        return MaterialSource(
-            material_id=material_id,
-            title=title,
-            audio_path=str(wav_path),
-            transcript=transcript,
-            source_url=episodes[0],
-            source_name="BBC Learning English - 6 Minute English",
-            duration_seconds=_wav_duration(wav_path),
-            timestamped_sentences=tuple(aligned),
-        )
+                return MaterialSource(
+                    material_id=material_id,
+                    title=title,
+                    audio_path=str(wav_path),
+                    transcript=transcript,
+                    source_url=episode_url,
+                    source_name="BBC Learning English - 6 Minute English",
+                    duration_seconds=_wav_duration(wav_path),
+                    timestamped_sentences=tuple(aligned),
+                )
+            except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
+                # Archive pages can remain listed after their downloadable
+                # audio/transcript is removed. Skip that item and continue
+                # searching instead of failing the whole "next material" flow.
+                last_error = exc
+                continue
+        raise ValueError(str(last_error) if last_error else "No usable BBC 6 Minute English episode available")
 
 
 def _wav_duration(wav_path: Path) -> float:
