@@ -1,10 +1,13 @@
-"""P1 candidate pipeline: search -> quality grades -> transcript validation
--> rank -> selection -> prepare (idempotent, recoverable)."""
+"""P1 candidate pipeline: governed search -> quality grades -> transcript
+validation -> rank -> selection -> prepare (idempotent, recoverable).
+
+The pipeline is source-governed: discovery only runs on an activated source,
+and only the next qualified course item may be prepared.
+"""
 
 from __future__ import annotations
 
 from pathlib import Path
-from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
@@ -23,13 +26,15 @@ from app.core.material_preparation import (
 from app.db.connection import Database
 from tests.fixtures import make_database, make_settings, make_sine_wav
 
-# Test uses a 1-2 minute band so synthetic WAVs are cheap; the production
-# default of 15-20 minutes stays in config.
+# Test uses a 1-2 minute band so synthetic WAVs are cheap; production passes no
+# band at all (the 15-20 minute gate is cancelled).
 DUR_MIN, DUR_MAX = 1.0, 2.0
+PLATFORM = "50LANGUAGES"
 
 
 class FakeVOADeepProvider:
-    """Provider that mimics the P1 VOA surface: entries with RSS durations."""
+    """Provider that mimics the governed catalog surface: ordered entries with
+    durations, accent, CEFR, license and transcript evidence."""
 
     def __init__(self, tmp_path: Path) -> None:
         self.tmp_path = tmp_path
@@ -38,6 +43,39 @@ class FakeVOADeepProvider:
 
     def _list_episodes(self, zone_ids=None) -> list[tuple[str, str, str, float | None]]:
         return self.entries
+
+    def catalog_items(self) -> list[dict[str, object]]:
+        return [
+            {
+                "source_item_id": f"item-{index}",
+                "title": title,
+                "source_url": article_url,
+                "audio_url": mp3_url,
+                "duration_seconds": duration,
+                "source_course": "course-a",
+                "course_order": 1,
+                "item_order": index,
+                "cefr_level": "A1",
+                "accent": "en-GB",
+                "speaker_id": "speaker-a",
+                "transcript": " ".join(
+                    f"Official sentence number {sentence} of this lesson." for sentence in range(1, 13)
+                ),
+                "transcript_origin": "OFFICIAL",
+                "transcript_verified": True,
+                "license_status": "CLEARED",
+                "license_reference": "fixture",
+            }
+            for index, (article_url, mp3_url, title, duration) in enumerate(self.entries, start=1)
+        ]
+
+    def catalog_info(self) -> dict[str, object]:
+        return {
+            "catalog_complete": True,
+            "known_total": len(self.entries),
+            "has_cursor": False,
+            "catalog_scope": "fixture",
+        }
 
     def download_audio(self, mp3_url: str, audio_id: str, work_dir: Path) -> Path:
         self.downloaded.append(audio_id)
@@ -88,6 +126,9 @@ def _service(tmp_path: Path) -> tuple[Database, MaterialCandidateService]:
         asr=FakeASR(),
         quality=AudioQualityAnalyzer(QualityThresholds(min_duration_seconds=30.0)),
     )
+    service.activate_source(
+        "default", PLATFORM, "fixture-license", "fixture-catalog", confirmed_by="TEST"
+    )
     return database, service
 
 
@@ -128,8 +169,9 @@ def test_search_dedupes_by_fingerprint(tmp_path: Path) -> None:
 
 def test_prepare_is_idempotent_and_recoverable(tmp_path: Path) -> None:
     database, service = _service(tmp_path)
-    result = service.search(scope_id="default", speed_stage="STAGE_1", target_duration_min=DUR_MIN, target_duration_max=DUR_MAX)
-    candidate_id = result["candidates"][0]["candidate_id"]
+    service.search(scope_id="default", speed_stage="STAGE_1", target_duration_min=DUR_MIN, target_duration_max=DUR_MAX)
+    # Only the next qualified course item may be ingested.
+    candidate_id = service.next_qualified("default")["candidate_id"]
     prep = MaterialPreparationService(database, make_settings(tmp_path))
 
     first = prep.prepare(candidate_id, "default", "key-1")
@@ -185,8 +227,8 @@ def test_prepare_rejects_expired_or_poor_candidates(tmp_path: Path) -> None:
 
 def test_api_prepare_round_trip(tmp_path: Path) -> None:
     database, service = _service(tmp_path)
-    result = service.search(scope_id="default", speed_stage="STAGE_1", target_duration_min=DUR_MIN, target_duration_max=DUR_MAX)
-    candidate_id = result["candidates"][0]["candidate_id"]
+    service.search(scope_id="default", speed_stage="STAGE_1", target_duration_min=DUR_MIN, target_duration_max=DUR_MAX)
+    candidate_id = service.next_qualified("default")["candidate_id"]
 
     original_settings = main_module.settings
     main_module.settings = make_settings(tmp_path)

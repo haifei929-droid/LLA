@@ -3,8 +3,8 @@
 - A failing analysis must never mark PASS; the recording stays on disk and
   can be re-analyzed.
 - An unfinished time log never counts toward learning stats.
-- A failed material search (network/ASR) degrades to the next provider and
-  never disturbs existing training state.
+- A failed material discovery never falls back to another platform and never
+  disturbs existing training state.
 - Material search failures surface as 409, not 500.
 """
 
@@ -21,7 +21,13 @@ from app.core.audio_quality import AudioQualityAnalyzer
 from app.core.material_search import MaterialSearchService
 from app.core.reading_service import ReadingService
 from app.db.connection import Database
-from tests.fixtures import DEFAULT_SENTENCES, make_database, make_settings, make_sine_wav
+from tests.fixtures import (
+    DEFAULT_SENTENCES,
+    create_material,
+    make_database,
+    make_settings,
+    make_sine_wav,
+)
 
 REFERENCE = [(2.0, 12000.0), (0.5, 0.0)]
 
@@ -29,8 +35,6 @@ REFERENCE = [(2.0, 12000.0), (0.5, 0.0)]
 def _material_with_audio(tmp_path: Path, database: Database, material_id: str = "m1") -> str:
     audio = tmp_path / "data" / "materials" / f"{material_id}.wav"
     make_sine_wav(audio, segments=REFERENCE)
-    from tests.fixtures import create_material
-
     create_material(database, material_id)
     with database.connect() as connection:
         connection.execute(
@@ -99,64 +103,46 @@ def test_unfinished_time_log_never_counts(tmp_path: Path) -> None:
 
 
 class BoomProvider:
-    def search_next(self, *, exclude_urls, work_dir, asr=None, criteria=None):
+    """Fails while listing the catalog: the governed entry must not fall back."""
+
+    def catalog_items(self):
         raise RuntimeError("network down")
 
 
-class GoodProvider:
-    def __init__(self, tmp_path: Path) -> None:
-        self.tmp_path = tmp_path
-
-    def search_next(self, *, exclude_urls, work_dir, asr=None, criteria=None):
-        from app.adapters.web_material import MaterialSource
-        from tests.fixtures import make_sine_wav
-
-        wav = self.tmp_path / "good.wav"
-        make_sine_wav(wav, segments=[(65.0, 12000.0)])
-        return MaterialSource(
-            material_id="good-001",
-            title="Good source",
-            audio_path=str(wav),
-            transcript="One sentence here. Two sentences there. Three more words.",
-            source_url="https://example.com/good",
-            source_name="Good",
-            duration_seconds=65.0,
-            timestamped_sentences=(
-                ("One sentence here.", 0.0, 5.0),
-                ("Two sentences there.", 5.5, 12.0),
-                ("Three more words.", 12.5, 18.0),
-            ),
-        )
+ACTIVE_PLATFORM = "50LANGUAGES"
 
 
-def test_search_failure_degrades_to_next_provider_and_keeps_state(tmp_path: Path) -> None:
+def test_search_failure_never_disturbs_training_state(tmp_path: Path) -> None:
     database = make_database(tmp_path)
     settings = make_settings(tmp_path)
-    create_before = MaterialSearchService(database, settings, providers=[], asr=None)
-    from tests.fixtures import create_material
-
     create_material(database, "keep-001")
     with database.connect() as connection:
         connection.execute(
             "UPDATE training_progress SET current_state = 'DICTATION_PART_2' WHERE material_id = 'keep-001'"
         )
 
-    service = MaterialSearchService(
-        database, settings, providers=[BoomProvider(), GoodProvider(tmp_path)], asr=None
+    service = MaterialSearchService(database, settings, providers=[BoomProvider()], asr=None)
+    service.candidates.activate_source(
+        "default", ACTIVE_PLATFORM, "fixture-license", "fixture-catalog"
     )
-    result = service.search_next()
-    assert result["material_id"] == "good-001"
+    with pytest.raises(ValueError, match="source failed"):
+        service.search_next()
     with database.connect() as connection:
         state = connection.execute(
             "SELECT current_state FROM training_progress WHERE material_id = 'keep-001'"
         ).fetchone()["current_state"]
+        materials = connection.execute("SELECT COUNT(*) AS n FROM materials").fetchone()["n"]
     assert state == "DICTATION_PART_2", "existing training state must survive a failed search"
+    assert materials == 1, "a failed search must not create a material"
 
 
-def test_all_providers_fail_raises_409_not_500(tmp_path: Path) -> None:
+def test_failed_search_raises_409_not_500(tmp_path: Path) -> None:
     database = make_database(tmp_path)
     settings = make_settings(tmp_path)
     service = MaterialSearchService(database, settings, providers=[BoomProvider()], asr=None)
+    service.candidates.activate_source(
+        "default", ACTIVE_PLATFORM, "fixture-license", "fixture-catalog"
+    )
     with pytest.raises(ValueError, match="source failed"):
         service.search_next()
 

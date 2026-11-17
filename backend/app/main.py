@@ -22,8 +22,6 @@ from app.core.difficulty_progression import DifficultyProgressionService
 from app.core.difficulty_history import DifficultyHistoryService
 from app.core.dashboard import DashboardService
 from app.core.memory_deepening import MemoryDeepeningService
-from app.adapters.voa_material import VOALearningEnglishProvider
-from app.adapters.web_material import BBCLearningEnglishProvider
 from app.db.connection import Database
 
 
@@ -44,12 +42,10 @@ async def lifespan(app: FastAPI):
     app.state.learning_time = LearningTimeService(database)
     app.state.weekly_assessments = WeeklyAssessmentService(database, settings)
     app.state.reading_service = ReadingService(database, settings)
-    # Provider priority: VOA slow English (standard) first, BBC as fallback.
-    app.state.material_search = MaterialSearchService(
-        database,
-        settings,
-        providers=[VOALearningEnglishProvider(), BBCLearningEnglishProvider()],
-    )
+    # Source governance: no platform is active and no adapter is registered
+    # until a user confirms a source with authorization evidence. Discovery and
+    # the legacy /materials/next entry therefore refuse with SOURCE_NOT_APPROVED
+    # instead of silently falling back to an unauthorized source.
     app.state.material_candidates = MaterialCandidateService(database, settings)
     app.state.difficulty = DifficultyProgressionService(
         database, WeeklyAssessmentService(database, settings)
@@ -57,9 +53,17 @@ async def lifespan(app: FastAPI):
     app.state.difficulty_history = DifficultyHistoryService(database)
     app.state.difficulty.history = app.state.difficulty_history
     app.state.material_preparation = MaterialPreparationService(
-        database, settings, history=app.state.difficulty_history
+        database, settings,
+        history=app.state.difficulty_history,
+        candidates=app.state.material_candidates,
     )
-    app.state.material_search.history = app.state.difficulty_history
+    app.state.material_search = MaterialSearchService(
+        database, settings,
+        candidates=app.state.material_candidates,
+        preparation=app.state.material_preparation,
+        history=app.state.difficulty_history,
+        difficulty=app.state.difficulty,
+    )
     app.state.dashboard = DashboardService(database)
     app.state.memory = MemoryDeepeningService(database)
     yield

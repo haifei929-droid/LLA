@@ -19,6 +19,7 @@ from uuid import uuid4
 
 from app.config import Settings
 from app.core.dictation import evaluate_dictation
+from app.core.material_candidates import active_source_platform
 from app.core.states import WeeklyState
 from app.core.time_window import week_window_start
 from app.db.connection import Database
@@ -150,23 +151,51 @@ class WeeklyAssessmentService:
         material. Generation is deterministic per week_id (seeded), and the
         count is configurable (item-count details are a pending-calibration
         item).
+
+        Source governance: the pool only contains verified, ingested material
+        that matches the active training source. Quarantined/historical or
+        unverified material never backfills the pool; when nothing qualifies
+        the reason is surfaced instead of silently sampling the whole library.
+        Already generated items are never rewritten.
         """
         self._ensure_exists(week_id)
         count = count or self.settings.weekly_test_sentence_count
         if count < 1:
             raise ValueError("count must be at least 1")
+        # Read the active source before opening the writing connection: the
+        # same connection must never be nested inside a write transaction.
+        active_platform = active_source_platform(self.database)
         with self.database.connect() as connection:
             existing = connection.execute(
                 "SELECT COUNT(*) AS n FROM weekly_test_items WHERE week_id = ? AND kind = 'TEST'",
                 (week_id,),
             ).fetchone()["n"]
-            if existing:
-                return self.list_test_items(week_id, kind="TEST")
-            pool = connection.execute(
-                "SELECT sentence_id, text FROM sentences ORDER BY material_id, sequence_no"
-            ).fetchall()
+            pool = (
+                []
+                if existing
+                else connection.execute(
+                    """
+                    SELECT s.sentence_id, s.text
+                      FROM sentences s
+                      JOIN materials m ON m.material_id = s.material_id
+                     WHERE m.ingestion_status = 'INGESTED'
+                       AND m.transcript_verified = 1
+                       AND m.accent IS NOT NULL
+                       AND lower(m.accent) NOT IN ('en-us', 'en_us', 'mixed', 'unknown')
+                       AND (m.prepare_status IS NULL OR m.prepare_status = 'READY')
+                       AND (? IS NULL OR m.source_platform = ?)
+                     ORDER BY s.material_id, s.sequence_no
+                    """,
+                    (active_platform, active_platform),
+                ).fetchall()
+            )
+        if existing:
+            return self.list_test_items(week_id, kind="TEST")
         if not pool:
-            raise ValueError("No sentences available; import material before generating the weekly test")
+            raise ValueError(
+                "No verified material matches the active training source; "
+                "the weekly test pool is empty (quarantined material is never used)"
+            )
         rng = random.Random(f"weekly:{week_id}")
         selected = rng.sample(list(pool), min(count, len(pool)))
         with self.database.connect() as connection:

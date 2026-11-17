@@ -1,18 +1,21 @@
-"""Material search service: difficulty rules -> provider -> ASR alignment ->
-preprocess -> store (Spec 24 provider pipeline)."""
+"""Material search service: the legacy `/api/materials/next` entry.
+
+The old entry point used to pick a provider list and apply the two-week
+recommendation rule; both are governance bypasses, so the service now delegates
+to the governed candidate flow: active source -> next qualified course item of
+that platform -> atomic ingestion. There is no parallel source selection and no
+cross-platform fallback: a provider failure stays a failure instead of quietly
+switching source, and difficulty upgrades stay with the existing eight-week
+confirmation mechanism (P1 difficulty progression).
+"""
 
 from __future__ import annotations
 
-from pathlib import Path
-
-from app.adapters.speech import WhisperASRProvider
-from app.adapters.web_material import BBCLearningEnglishProvider, MaterialSource
 from app.config import Settings
-from app.core.audio_quality import AudioQualityAnalyzer, QualityThresholds
-from app.core.material_recommender import MaterialRecommender
+from app.core.material_candidates import MaterialCandidateService, SourceGovernanceError
+from app.core.material_preparation import MaterialPreparationService, MaterialSelectionError
 from app.core.materials import MaterialStore
 from app.db.connection import Database
-from app.preprocess.material import MaterialPreprocessor, TimestampedSentence
 
 
 class MaterialSearchService:
@@ -22,92 +25,93 @@ class MaterialSearchService:
         settings: Settings,
         providers=None,
         asr=None,
-        recommender: MaterialRecommender | None = None,
-        quality: AudioQualityAnalyzer | None = None,
+        recommender=None,
+        quality=None,
         history=None,
+        candidates: MaterialCandidateService | None = None,
+        preparation: MaterialPreparationService | None = None,
+        difficulty=None,
     ) -> None:
         self.database = database
         self.settings = settings
-        # Provider priority: slow clear sources first (VOA standard), then BBC.
-        self.providers = list(providers) if providers else [BBCLearningEnglishProvider()]
-        self.asr = asr or WhisperASRProvider()
-        self.recommender = recommender or MaterialRecommender()
-        self.quality = quality or AudioQualityAnalyzer(
-            QualityThresholds(
-                min_sample_rate=settings.audio_quality_min_sample_rate,
-                acceptable_min_snr_db=settings.audio_quality_min_snr_db,
-                max_silence_ratio=settings.audio_quality_max_silence_ratio,
-                min_duration_seconds=settings.audio_quality_min_duration_seconds,
-            )
+        provider_list = list(providers) if providers else []
+        self.providers = provider_list
+        self.candidates = candidates or MaterialCandidateService(
+            database,
+            settings,
+            provider=(provider_list[0] if provider_list else None),
+            asr=asr,
+            quality=quality,
+        )
+        self.preparation = preparation or MaterialPreparationService(
+            database, settings, candidates=self.candidates
         )
         self.store = MaterialStore(database)
         self.history = history
+        self.difficulty = difficulty
+        # Kept only so nothing still importable disappears; it no longer
+        # decides source selection or upgrades.
+        self.recommender = recommender
 
-    def search_next(self) -> dict[str, object]:
-        profile = self._latest_completed_profile()
-        gate_passes = self._consecutive_gate_passes()
-        criteria = self.recommender.next_criteria(profile, gate_passes)
-
-        excluded = self._imported_source_urls()
-        last_error: str | None = None
-        for provider in self.providers:
-            try:
-                source = provider.search_next(
-                    exclude_urls=excluded, work_dir=self.settings.processed_dir / "web",
-                    asr=self.asr, criteria=criteria,
-                )
-            except ValueError as exc:
-                last_error = str(exc)
-                continue
-            except (OSError, RuntimeError) as exc:
-                # Network/ASR failures degrade to the next provider; the
-                # training state is untouched (Spec 31.10).
-                last_error = f"source failed: {exc}"
-                continue
-            try:
-                quality = self.quality.analyze(source.audio_path)
-                quality_passed = quality.passed
-            except (OSError, ValueError) as exc:
-                last_error = f"source rejected: {exc}"
-                quality_passed = False
-            if not quality_passed:
-                if last_error is None:
-                    last_error = (
-                        f"source rejected by audio-quality gate "
-                        f"(snr={quality.snr_db:.0f}dB, silence={quality.silence_ratio:.0%})"
-                    )
-                excluded.add(source.source_url or "")
-                continue
-            material = MaterialPreprocessor().process(
-                material_id=source.material_id,
-                title=source.title,
-                audio_path=source.audio_path,
-                transcript=source.transcript,
-                timestamped_sentences=[
-                    TimestampedSentence(text=text, start_time=start, end_time=end)
-                    for text, start, end in source.timestamped_sentences
-                ],
+    def search_next(self, scope_id: str = "default") -> dict[str, object]:
+        active = self.candidates.active_source(scope_id)
+        if active is None:
+            raise ValueError(
+                "SOURCE_NOT_APPROVED: no active material source; "
+                "a platform must be confirmed before fetching the next material"
             )
-            self._store_with_source(material, source)
-            return {
-                "material_id": material.material_id,
-                "title": material.title,
-                "duration_seconds": material.duration_seconds,
-                "speech_rate_wpm": material.speech_rate_wpm,
-                "sentence_count": len(material.sentences),
-                "source_url": source.source_url,
-                "source_name": source.source_name,
-                "upgrade_available": criteria.upgrade_available,
-                "criteria": {
-                    "duration_band": criteria.duration_band,
-                    "wpm_max": criteria.wpm_max,
-                },
-            }
-        raise ValueError(last_error or "No new material could be searched")
+        candidate = self.candidates.next_qualified(scope_id)
+        if candidate is None:
+            # One governed discovery pass over the active platform only.
+            try:
+                self.candidates.search(scope_id=scope_id)
+            except SourceGovernanceError:
+                raise
+            except Exception as exc:
+                raise ValueError(f"source failed: {exc}") from exc
+            candidate = self.candidates.next_qualified(scope_id)
+        if candidate is None:
+            raise ValueError(
+                "No qualified material is available from the active source; "
+                "review the pending candidates or the completion report"
+            )
+
+        idempotency_key = (
+            f"next:{scope_id}:{active['platform']}:{active['cycle']}:"
+            f"{candidate['candidate_id']}"
+        )
+        try:
+            prepared = self.preparation.prepare(
+                candidate["candidate_id"], scope_id, idempotency_key
+            )
+        except MaterialSelectionError as exc:
+            raise ValueError(f"{exc.code}: {exc}") from exc
+
+        material = self.store.get(prepared["material_id"]) or {}
+        prompt = (
+            self.difficulty.current_prompt(scope_id) if self.difficulty is not None else None
+        )
+        return {
+            "material_id": material.get("material_id", prepared["material_id"]),
+            "title": material.get("title"),
+            "duration_seconds": material.get("duration_seconds"),
+            "speech_rate_wpm": material.get("speech_rate_wpm"),
+            "sentence_count": len(material.get("sentences") or []),
+            "source_url": material.get("source_url"),
+            "source_name": material.get("source_name"),
+            "source_platform": material.get("source_platform"),
+            "accent": material.get("accent"),
+            "cefr_level": material.get("cefr_level"),
+            "ingestion_status": material.get("ingestion_status"),
+            "candidate_id": candidate["candidate_id"],
+            "upgrade_available": prompt is not None,
+            "upgrade_prompt_id": None if prompt is None else prompt["prompt_id"],
+        }
 
     def skip(self, material_id: str) -> dict[str, object]:
         """User skip: the material is retired from the active list (Spec 12
-        pace control). Its source URL stays excluded from future searches."""
+        pace control). Its source identity stays ingested, so the next
+        qualified course item is what the next fetch returns."""
         with self.database.connect() as connection:
             row = connection.execute(
                 "SELECT material_id FROM materials WHERE material_id = ?", (material_id,)
@@ -124,54 +128,3 @@ class MaterialSearchService:
                 reason="user skipped material",
             )
         return {"material_id": material_id, "status": "SKIPPED"}
-
-    def _store_with_source(self, material, source: MaterialSource) -> None:
-        self.store.create(material)
-        with self.database.connect() as connection:
-            connection.execute(
-                """
-                UPDATE materials
-                   SET source_url = ?, source_name = ?
-                 WHERE material_id = ?
-                """,
-                (source.source_url, source.source_name, material.material_id),
-            )
-
-    def _latest_completed_profile(self) -> dict[str, float] | None:
-        with self.database.connect() as connection:
-            row = connection.execute(
-                """
-                SELECT m.duration_seconds, m.speech_rate_wpm
-                  FROM materials m
-                  JOIN training_progress p ON p.material_id = m.material_id
-                 WHERE p.current_state IN ('LISTENING_COMPLETED', 'FULLY_COMPLETED')
-                 ORDER BY p.updated_at DESC
-                 LIMIT 1
-                """,
-            ).fetchone()
-        if row is None or row["speech_rate_wpm"] is None:
-            return None
-        return {
-            "duration_minutes": row["duration_seconds"] / 60.0,
-            "wpm": row["speech_rate_wpm"],
-        }
-
-    def _consecutive_gate_passes(self) -> int:
-        with self.database.connect() as connection:
-            rows = connection.execute(
-                "SELECT gate_status FROM weekly_assessments ORDER BY created_at DESC"
-            ).fetchall()
-        passes = 0
-        for row in rows:
-            if row["gate_status"] == "WEEKLY_GATE_PASS":
-                passes += 1
-            else:
-                break
-        return passes
-
-    def _imported_source_urls(self) -> set[str]:
-        with self.database.connect() as connection:
-            rows = connection.execute(
-                "SELECT source_url FROM materials WHERE source_url IS NOT NULL"
-            ).fetchall()
-        return {row["source_url"] for row in rows}

@@ -102,3 +102,20 @@ Runtime：临时 SQLite+本地文件+现有测试 API，模拟重启、事务中
 Review：正确性、最小性、入口旁路、事务原子性、历史保护及最终 diff。
 
 DSH 交付完整 SHA、变更清单、逐条测试结果、运行证据与剩余风险。Codex 仅在同 SHA 主仓 clean 状态正式验收；未通过不得 Close。真实来源接入与批量采集仍为未完成事项，不得用治理离线测试通过宣称整个素材来源任务 Closed。
+
+## 实施证据（DSH，2026-11-17）
+
+实现提交见 `docs/LLA_Source_Governance_Verification.md` 记录的交付 SHA。本轮为代码治理实现，未接入真实平台、未激活任何来源、未访问网络素材、未修改主库数据。
+
+按上述「最小方案与预计文件」逐项落地：
+
+1. `backend/app/db/schema.sql`、`connection.py`：新增 materials/候选表治理字段（accent、cefr_level、transcript_verified、license_status、ingestion_status、source_course、item_order、审核与证据字段、`ingestion_result_json`）；`connection.py` 以 ALTER + `IF NOT EXISTS` 增量迁移，来源身份唯一索引（`provider + provider_item_id`、`materials.source_candidate_id`）在存在历史重复时降级为普通索引并把状态写入 `app_metadata`，不删除任何历史行。历史素材保持 accent NULL、`QUARANTINED`，不做 en-GB 回填。
+2. `core/material_candidates.py`：候选表即持久发现清单；`app_metadata` 保存唯一当前来源周期、目录范围/游标、完成报告与确认记录。新增 `activate_source` / `source_state` / `report` / `confirm_switch` / `review_candidate` / `list_candidates` / `next_qualified`，取消 VOA 默认与跨平台回退；下载先落 staging，完整性校验后 `os.replace` 原子发布。
+3. `core/material_search.py`、`main.py`：旧 next 入口改为调用治理流程（当前主源 → 下一合格课程项 → 原子入库），删除两次周测升级旁路与多 provider 回退；`main.py` 不再注册 VOA/BBC 默认 provider。
+4. `core/material_preparation.py`、`materials.py`、`transcript_validator.py`：入库前复验 accent/license/CEFR/transcript/quality 与课程顺序；幂等重放先于过期/换源检查返回原结果；素材、句子、初始进度、来源关联、入库状态同事务提交；新增 `transcript_verification`，机器对齐与 ASR 相似度不得等同 `transcript_verified`。
+5. `api/routes.py`、`api/schemas.py`、`frontend/src/App.jsx`、`CandidatePanel.jsx`：新增 `/api/p1/source/*`、候选清单（不含 transcript）、审核与确认接口；手工导入声明 en-US 直接 400，其余一律隔离入库；候选页展示主源、报告、待审/隔离/失败原因与顺序；取消 15–20 分钟默认区间。
+6. `core/weekly.py`：新题池仅取 `INGESTED` + `transcript_verified` + 非 en-US 口音 + 与当前主源一致的材料；空池显式返回原因，不回退隔离库，已生成题池不变。
+7. 新增 `backend/tests/test_source_governance.py`；更新 `test_p1_candidates.py`、`test_p1_critical_fixes.py`、`test_material_search.py`、`test_exceptions.py`、`test_weekly_loop.py`、`test_migrations.py`。
+8. 新增 `docs/LLA_Source_Governance_Verification.md`；本文档追加本节实施证据。
+
+未决（保持 Out of Scope / Backlog）：真实平台适配器与授权、逐课 CEFR/口音/稿音人工核验、联网小规模验证、主库正式迁移执行。

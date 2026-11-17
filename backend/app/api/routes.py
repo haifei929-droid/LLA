@@ -10,8 +10,12 @@ from app.api.schemas import (
     ComprehensionCheckRequest,
     DictationSubmitRequest,
     MaterialCreateRequest,
+    P1CandidateReviewRequest,
     P1CandidateSearchRequest,
     P1PrepareRequest,
+    P1SourceActivateRequest,
+    P1SourceConfirmSwitchRequest,
+    P1SourceStateRequest,
     P1UpgradeDecisionRequest,
     P1WeeklyGateRequest,
     P2MemoryConfigRequest,
@@ -25,6 +29,11 @@ from app.api.schemas import (
     WeeklyReadingRequest,
     WeeklyTestItemDictationRequest,
     WeeklyTestItemsRequest,
+)
+from app.core.material_candidates import (
+    SourceGovernanceError,
+    is_excluded_accent,
+    normalize_accent,
 )
 from app.core.material_preparation import MaterialSelectionError
 from app.core.difficulty_progression import DifficultyError
@@ -50,6 +59,19 @@ def health(request: Request) -> dict[str, str]:
 
 @router.post("/materials", status_code=status.HTTP_201_CREATED)
 def create_material(payload: MaterialCreateRequest, request: Request) -> dict[str, object]:
+    """Manual import.
+
+    A manual import carries no source evidence, so it is stored quarantined:
+    it stays available as history and can be trained by its owner, but it never
+    enters new recommendation, new ingestion or the weekly question pool. An
+    explicit en-US declaration is refused outright.
+    """
+    accent = normalize_accent(payload.accent)
+    if is_excluded_accent(accent):
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "ACCENT_NOT_ELIGIBLE", "message": "en-US material cannot enter the training library"},
+        )
     try:
         material = MaterialPreprocessor().process(
             material_id=payload.material_id,
@@ -59,7 +81,17 @@ def create_material(payload: MaterialCreateRequest, request: Request) -> dict[st
             timestamped_sentences=[TimestampedSentence(**item.model_dump()) for item in payload.timestamped_sentences],
             natural_part_boundaries=payload.natural_part_boundaries,
         )
-        request.app.state.material_store.create(material)
+        request.app.state.material_store.create(
+            material,
+            source={"source_type": "PRESET", "source_name": "manual import"},
+            governance={
+                "source_platform": "MANUAL_IMPORT",
+                "accent": accent,
+                "transcript_verified": 0,
+                "license_status": "UNKNOWN",
+                "ingestion_status": "QUARANTINED",
+            },
+        )
     except MaterialExistsError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except (MaterialPreprocessError, ValueError) as exc:
@@ -72,6 +104,8 @@ def create_material(payload: MaterialCreateRequest, request: Request) -> dict[st
         "duration_seconds": material.duration_seconds,
         "sentence_count": len(material.sentences),
         "status": material.status,
+        "ingestion_status": "QUARANTINED",
+        "accent": accent,
     }
 
 
@@ -129,8 +163,23 @@ def skip_material(material_id: str, request: Request) -> dict[str, object]:
 # ================= P1: material candidates & difficulty progression =================
 
 def _p1_error(exc: MaterialSelectionError | DifficultyError) -> HTTPException:
-    status = 409 if exc.code in ("IDEMPOTENCY_CONFLICT", "PROMPT_ALREADY_RESOLVED") else 400
+    status = 409 if exc.code in (
+        "IDEMPOTENCY_CONFLICT",
+        "PROMPT_ALREADY_RESOLVED",
+        "COURSE_ORDER_VIOLATION",
+        "SOURCE_NOT_APPROVED",
+        "SOURCE_PENDING_REVIEW",
+        "ACCENT_NOT_ELIGIBLE",
+        "LICENSE_UNVERIFIED",
+        "TRANSCRIPT_UNVERIFIED",
+        "CEFR_UNVERIFIED",
+        "NO_QUALIFIED_CANDIDATE",
+    ) else 400
     return HTTPException(status_code=status, detail={"code": exc.code, "message": str(exc)})
+
+
+def _governance_error(exc: SourceGovernanceError) -> HTTPException:
+    return HTTPException(status_code=409, detail={"code": exc.code, "message": exc.message})
 
 
 @router.post("/p1/material-candidates/search")
@@ -143,6 +192,36 @@ def p1_search_candidates(payload: P1CandidateSearchRequest, request: Request) ->
             target_duration_max=payload.target_duration_max,
             max_results=payload.max_results,
         )
+    except SourceGovernanceError as exc:
+        raise _governance_error(exc) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/p1/material-candidates")
+def p1_list_candidates(
+    request: Request, scope_id: str = "default", status: str | None = None
+) -> list[dict[str, object]]:
+    """Persisted discovery list (metadata only; the transcript is not leaked)."""
+    return request.app.state.material_candidates.list_candidates(scope_id, status)
+
+
+@router.post("/p1/material-candidates/{candidate_id}/review")
+def p1_review_candidate(
+    candidate_id: str, payload: P1CandidateReviewRequest, request: Request
+) -> dict[str, object]:
+    try:
+        return request.app.state.material_candidates.review_candidate(
+            candidate_id,
+            payload.scope_id,
+            decision=payload.decision,
+            accent=payload.accent,
+            transcript_verified=payload.transcript_verified,
+            reviewer=payload.reviewer,
+            note=payload.note,
+        )
+    except SourceGovernanceError as exc:
+        raise _governance_error(exc) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -155,6 +234,53 @@ def p1_prepare_candidate(candidate_id: str, payload: P1PrepareRequest, request: 
         )
     except MaterialSelectionError as exc:
         raise _p1_error(exc) from exc
+
+
+@router.get("/p1/source/state")
+def p1_source_state(request: Request, scope_id: str = "default") -> dict[str, object]:
+    return request.app.state.material_candidates.source_state(scope_id)
+
+
+@router.post("/p1/source/activate")
+def p1_source_activate(payload: P1SourceActivateRequest, request: Request) -> dict[str, object]:
+    try:
+        return request.app.state.material_candidates.activate_source(
+            payload.scope_id,
+            payload.platform,
+            payload.license_reference,
+            payload.catalog_scope,
+            expected_cycle=payload.expected_cycle,
+            confirmed_by=payload.confirmed_by,
+            note=payload.note,
+        )
+    except SourceGovernanceError as exc:
+        raise _governance_error(exc) from exc
+
+
+@router.post("/p1/source/report")
+def p1_source_report(payload: P1SourceStateRequest, request: Request) -> dict[str, object]:
+    try:
+        return request.app.state.material_candidates.report(payload.scope_id)
+    except SourceGovernanceError as exc:
+        raise _governance_error(exc) from exc
+
+
+@router.post("/p1/source/confirm-switch")
+def p1_source_confirm_switch(
+    payload: P1SourceConfirmSwitchRequest, request: Request
+) -> dict[str, object]:
+    try:
+        return request.app.state.material_candidates.confirm_switch(
+            payload.scope_id,
+            payload.report_id,
+            payload.next_platform,
+            payload.license_reference,
+            payload.catalog_scope,
+            acknowledge_pending=payload.acknowledge_pending,
+            confirmed_by=payload.confirmed_by,
+        )
+    except SourceGovernanceError as exc:
+        raise _governance_error(exc) from exc
 
 
 @router.post("/p1/difficulty/weekly-gate")

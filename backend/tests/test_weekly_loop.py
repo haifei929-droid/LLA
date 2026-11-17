@@ -36,6 +36,27 @@ def _log_training(database: Database, tmp_path: Path, *activities: str) -> None:
         time_service.stop(started["time_log_id"], 60)
 
 
+def _govern(database: Database, *material_ids: str) -> None:
+    """Mark fixture materials as verified library entries.
+
+    The new weekly pool only uses verified, ingested material (source
+    governance). These fixtures stand in for material that already passed
+    accent/license/transcript verification, so the pool tests can keep using
+    them without weakening any other assertion.
+    """
+    with database.connect() as connection:
+        for material_id in material_ids:
+            connection.execute(
+                """
+                UPDATE materials
+                   SET ingestion_status = 'INGESTED', transcript_verified = 1,
+                       accent = 'en-GB', source_platform = 'PRESET', cefr_level = 'A1'
+                 WHERE material_id = ?
+                """,
+                (material_id,),
+            )
+
+
 def test_test_type_follows_weekly_training(tmp_path: Path) -> None:
     database = make_database(tmp_path)
     service = _weekly_service(database, tmp_path)
@@ -80,6 +101,7 @@ def test_score_below_threshold_forces_failure(tmp_path: Path) -> None:
 def test_weekly_test_items_and_auto_score(tmp_path: Path) -> None:
     database = make_database(tmp_path)
     create_material(database, "m1")
+    _govern(database, "m1")
     service = _weekly_service(database, tmp_path)
     service.create(
         week_id="W1", period_start="2026-08-24", period_end="2026-08-30",
@@ -102,9 +124,27 @@ def test_weekly_test_items_and_auto_score(tmp_path: Path) -> None:
     assert assessment["gate_status"] == "REINFORCEMENT_REQUIRED"
 
 
+def test_weekly_pool_requires_verified_material(tmp_path: Path) -> None:
+    """New test items only come from verified, ingested material."""
+    database = make_database(tmp_path)
+    create_material(database, "unverified")
+    service = _weekly_service(database, tmp_path)
+    service.create(
+        week_id="W1", period_start="2026-08-24", period_end="2026-08-30",
+        dictation_required=True, reading_required=False,
+    )
+    with pytest.raises(ValueError, match="verified material"):
+        service.create_test_items("W1", count=2)
+    with database.connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) AS n FROM weekly_test_items"
+        ).fetchone()["n"] == 0
+
+
 def test_reinforcement_loop_recovers_gate(tmp_path: Path) -> None:
     database = make_database(tmp_path)
     create_material(database, "m1")
+    _govern(database, "m1")
     service = _weekly_service(database, tmp_path)
     service.create(
         week_id="W1", period_start="2026-08-24", period_end="2026-08-30",
@@ -141,6 +181,7 @@ def test_reinforcement_loop_recovers_gate(tmp_path: Path) -> None:
 def test_weekly_api_round_trip(tmp_path: Path) -> None:
     database = make_database(tmp_path)
     create_material(database, "api-m1")
+    _govern(database, "api-m1")
     original_settings = main_module.settings
     main_module.settings = make_settings(tmp_path)
     try:

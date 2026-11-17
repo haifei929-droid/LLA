@@ -28,6 +28,13 @@ from tests.fixtures import DEFAULT_SENTENCES, make_database, make_settings, make
 
 NOW = datetime(2026, 8, 26, 10, 0, 0, tzinfo=UTC)
 DUR_MIN, DUR_MAX = 1.0, 2.0
+PLATFORM = "50LANGUAGES"
+
+
+def _activate(service: MaterialCandidateService) -> None:
+    service.activate_source(
+        "default", PLATFORM, "fixture-license", "fixture-catalog", confirmed_by="TEST"
+    )
 
 
 # ------------------------- F1: bounded retry -------------------------
@@ -40,6 +47,37 @@ class FlakyDownloadProvider:
 
     def _list_episodes(self, zone_ids=None) -> list[tuple[str, str, str, float | None]]:
         return [("https://voa.example/a/1.html", "https://voa.example/a1.mp3", "Flaky", 80.0)]
+
+    def catalog_items(self) -> list[dict[str, object]]:
+        return [
+            {
+                "source_item_id": "flaky-1",
+                "title": "Flaky",
+                "source_url": "https://voa.example/a/1.html",
+                "audio_url": "https://voa.example/a1.mp3",
+                "duration_seconds": 80.0,
+                "source_course": "course-a",
+                "course_order": 1,
+                "item_order": 1,
+                "cefr_level": "A1",
+                "accent": "en-GB",
+                "transcript": " ".join(
+                    f"Official sentence number {index} of this lesson." for index in range(1, 13)
+                ),
+                "transcript_origin": "OFFICIAL",
+                "transcript_verified": True,
+                "license_status": "CLEARED",
+                "license_reference": "fixture",
+            }
+        ]
+
+    def catalog_info(self) -> dict[str, object]:
+        return {
+            "catalog_complete": True,
+            "known_total": 1,
+            "has_cursor": False,
+            "catalog_scope": "fixture",
+        }
 
     def download_audio(self, mp3_url: str, audio_id: str, work_dir: Path) -> Path:
         self.attempts += 1
@@ -66,6 +104,7 @@ def test_f1_transient_provider_failure_recovers_by_retry(tmp_path: Path, monkeyp
         quality=AudioQualityAnalyzer(QualityThresholds(min_duration_seconds=30.0)),
         now_fn=lambda: NOW,
     )
+    _activate(service)
     monkeypatch.setattr("app.core.material_candidates.RETRY_BACKOFF_SECONDS", 0.0)
     result = service.search(scope_id="default", speed_stage="STAGE_1", target_duration_min=DUR_MIN, target_duration_max=DUR_MAX)
     assert provider.attempts == 2
@@ -81,6 +120,7 @@ def test_f1_exhausted_retry_rejects_entry(tmp_path: Path, monkeypatch) -> None:
         quality=AudioQualityAnalyzer(QualityThresholds(min_duration_seconds=30.0)),
         now_fn=lambda: NOW,
     )
+    _activate(service)
     monkeypatch.setattr("app.core.material_candidates.RETRY_BACKOFF_SECONDS", 0.0)
     monkeypatch.setattr("app.core.material_candidates.RETRY_LIMIT", 2)
     result = service.search(scope_id="default", speed_stage="STAGE_1", target_duration_min=DUR_MIN, target_duration_max=DUR_MAX)
@@ -263,6 +303,7 @@ def test_f5_search_audit_is_persisted(tmp_path: Path) -> None:
         quality=AudioQualityAnalyzer(QualityThresholds(min_duration_seconds=30.0)),
         now_fn=lambda: NOW,
     )
+    _activate(service)
     service.search(scope_id="default", speed_stage="STAGE_1", target_duration_min=DUR_MIN, target_duration_max=DUR_MAX)
     with database.connect() as connection:
         row = connection.execute(
@@ -270,7 +311,7 @@ def test_f5_search_audit_is_persisted(tmp_path: Path) -> None:
         ).fetchone()
     assert row is not None
     assert row["speed_stage"] == "STAGE_1"
-    assert row["provider"] == "VOA"
+    assert row["provider"] == PLATFORM
     assert row["analyzer_version"] == "1.0"
     assert row["threshold_config_version"] == "1.0"
     assert row["candidate_count"] == 1

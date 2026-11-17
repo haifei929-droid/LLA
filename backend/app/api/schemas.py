@@ -18,6 +18,10 @@ class MaterialCreateRequest(BaseModel):
     timestamped_sentences: list[TimestampedSentenceInput] = Field(min_length=3)
     #: Optional 1-based sentence indexes of natural semantic part boundaries.
     natural_part_boundaries: list[int] | None = None
+    #: Declared accent of the audio. Manual import cannot prove its source
+    #: evidence, so the material is stored quarantined; an explicit en-US
+    #: declaration is rejected outright.
+    accent: str | None = None
 
 
 class DictationSubmitRequest(BaseModel):
@@ -90,14 +94,50 @@ class RecordingScoreRequest(BaseModel):
 class P1CandidateSearchRequest(BaseModel):
     scope_id: str = Field(default="default")
     speed_stage: str = "STAGE_1"
-    target_duration_min: float = Field(default=15.0, ge=1)
-    target_duration_max: float = Field(default=20.0, ge=1)
+    #: Optional explicit duration band. It is no longer a 15-20 minute default:
+    #: the original full lesson length is allowed unless the caller asks for a
+    #: band, and the audio-quality bar stays in force either way.
+    target_duration_min: float | None = Field(default=None, ge=1)
+    target_duration_max: float | None = Field(default=None, ge=1)
     max_results: int = Field(default=3, ge=1, le=3)
 
 
 class P1PrepareRequest(BaseModel):
     scope_id: str = Field(default="default")
     idempotency_key: str = Field(min_length=1)
+
+
+class P1CandidateReviewRequest(BaseModel):
+    scope_id: str = Field(default="default")
+    decision: Literal["APPROVE", "REJECT"]
+    accent: str | None = None
+    transcript_verified: bool | None = None
+    reviewer: str = Field(default="USER")
+    note: str | None = None
+
+
+class P1SourceStateRequest(BaseModel):
+    scope_id: str = Field(default="default")
+
+
+class P1SourceActivateRequest(BaseModel):
+    scope_id: str = Field(default="default")
+    platform: str = Field(min_length=1)
+    license_reference: str = Field(min_length=1)
+    catalog_scope: str = Field(min_length=1)
+    expected_cycle: int = Field(default=0, ge=0)
+    confirmed_by: str = Field(default="USER")
+    note: str | None = None
+
+
+class P1SourceConfirmSwitchRequest(BaseModel):
+    scope_id: str = Field(default="default")
+    report_id: str = Field(min_length=1)
+    next_platform: str = Field(min_length=1)
+    license_reference: str = Field(min_length=1)
+    catalog_scope: str = Field(min_length=1)
+    acknowledge_pending: bool = False
+    confirmed_by: str = Field(default="USER")
 
 
 class P1WeeklyGateRequest(BaseModel):

@@ -4,6 +4,12 @@ The transcript must exist and correspond to the audio. VOA's official
 transcript is client-side only, so candidates carry an ASR-generated
 transcript; its completeness is judged by sentence coverage of the audio
 timeline, and mismatches (garbled/empty output) are rejected.
+
+Timeline coverage is not transcript *verification*: machine alignment (or a
+high ASR similarity score) can never promote a transcript to verified, because
+the timestamps only prove that the sentence layout covers the audio. Only an
+official transcript with declared evidence is verifiable; anything else stays
+pending human review.
 """
 
 from __future__ import annotations
@@ -11,6 +17,12 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
+
+#: Transcript evidence states consumed by the source-governance service.
+TRANSCRIPT_VERIFIED = "VERIFIED"
+TRANSCRIPT_PENDING_REVIEW = "PENDING_REVIEW"
+TRANSCRIPT_REJECTED = "REJECTED"
+OFFICIAL_ORIGIN = "OFFICIAL"
 
 
 @dataclass(frozen=True)
@@ -48,6 +60,27 @@ def validate_transcript(
         return TranscriptValidation("INCOMPLETE", len(sentences), coverage, "too few sentences")
 
     return TranscriptValidation("COMPLETE", len(sentences), coverage, None)
+
+
+def transcript_verification(
+    validation: TranscriptValidation,
+    transcript_origin: str | None,
+    declared_verified: bool = False,
+) -> str:
+    """Decide the transcript evidence state for a candidate.
+
+    - a failed validation is rejected outright;
+    - ASR-generated text is never verified by alignment/coverage alone;
+    - an official transcript still needs declared (human) evidence before it
+      counts as verified.
+    """
+    if validation.status != "COMPLETE":
+        return TRANSCRIPT_REJECTED
+    if str(transcript_origin or "").upper() != OFFICIAL_ORIGIN:
+        return TRANSCRIPT_PENDING_REVIEW
+    if not declared_verified:
+        return TRANSCRIPT_PENDING_REVIEW
+    return TRANSCRIPT_VERIFIED
 
 
 def encode_timestamped(sentences: list[tuple[str, float, float]]) -> str:

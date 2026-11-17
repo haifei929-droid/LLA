@@ -1,5 +1,5 @@
-"""Auto-search material: difficulty rules (Spec 3.1/16), transcript-ASR
-alignment (Spec 24.1), and the search service pipeline with a fake provider."""
+"""Material discovery: transcription alignment (Spec 24.1), the legacy
+difficulty recommender values, and the governed next-material pipeline.""" 
 
 from __future__ import annotations
 
@@ -9,10 +9,10 @@ import pytest
 
 from app.adapters.speech import RecognizedSegment
 from app.adapters.web_material import BBCLearningEnglishProvider, align_sentences, split_sentences
-from app.core.material_recommender import MaterialRecommender, SearchCriteria
+from app.core.material_candidates import SOURCE_LABELS
+from app.core.material_recommender import MaterialRecommender
 from app.core.material_search import MaterialSearchService
-from app.db.connection import Database
-from tests.fixtures import create_material, make_database, make_settings
+from tests.fixtures import create_material, make_database, make_settings, make_sine_wav
 
 
 def test_recommender_starts_at_standard_slow() -> None:
@@ -130,93 +130,165 @@ def test_bbc_provider_skips_episode_without_downloadable_audio(monkeypatch, tmp_
     assert visited == [bad_url, good_url]
 
 
-class FakeProvider:
-    def __init__(self, tmp_path: Path, pass_quality: bool = True) -> None:
-        self.called_with: dict[str, object] = {}
-        self._count = 0
-        self._tmp_path = tmp_path
-        self.pass_quality = pass_quality
+class FakeASR:
+    """Sentence-shaped deterministic segments covering the fixture audio."""
 
-    def search_next(self, *, exclude_urls, work_dir, asr=None, criteria=None) -> object:
-        self.called_with = {
-            "exclude_urls": exclude_urls,
-            "work_dir": work_dir,
-            "asr": asr,
-            "criteria": criteria,
+    def transcribe(self, audio_path: str) -> list[RecognizedSegment]:
+        return [
+            RecognizedSegment(
+                text=f"Sample sentence number {index} has enough words.",
+                start_time=index * 1.9,
+                end_time=index * 1.9 + 1.8,
+            )
+            for index in range(32)
+        ]
+
+
+OFFICIAL_TRANSCRIPT = " ".join(
+    f"Official sentence number {index} of this lesson." for index in range(1, 13)
+)
+PLATFORM = "50LANGUAGES"
+
+
+def catalog_item(
+    index: int,
+    *,
+    item_order: int | None = None,
+    accent: str = "en-GB",
+    cefr_level: str = "A1",
+    poor_audio: bool = False,
+) -> dict[str, object]:
+    return {
+        "source_item_id": f"web-test-{index:03d}",
+        "title": f"Fake episode {index}",
+        "source_url": f"https://example.com/ep-{index}",
+        "audio_url": (
+            f"https://example.com/ep-{index}-poor.mp3" if poor_audio
+            else f"https://example.com/ep-{index}.mp3"
+        ),
+        "duration_seconds": 65.0,
+        "source_course": "fixture-course",
+        "course_order": 1,
+        "item_order": item_order if item_order is not None else index,
+        "cefr_level": cefr_level,
+        "accent": accent,
+        "speaker_id": "speaker-a",
+        "transcript": OFFICIAL_TRANSCRIPT,
+        "transcript_origin": "OFFICIAL",
+        "transcript_verified": True,
+        "license_status": "CLEARED",
+        "license_reference": "fixture",
+    }
+
+
+class GovernedFakeProvider:
+    """Offline provider exposing a declared catalog snapshot."""
+
+    def __init__(self, tmp_path: Path, items: list[dict[str, object]] | None = None) -> None:
+        self.tmp_path = tmp_path
+        self.items = items if items is not None else [catalog_item(1), catalog_item(2)]
+        self.calls = 0
+
+    def catalog_items(self) -> list[dict[str, object]]:
+        self.calls += 1
+        return list(self.items)
+
+    def catalog_info(self) -> dict[str, object]:
+        return {
+            "catalog_complete": True,
+            "known_total": len(self.items),
+            "has_cursor": False,
+            "catalog_scope": "fixture",
         }
-        from app.adapters.web_material import MaterialSource
-        from tests.fixtures import make_sine_wav
 
-        self._count += 1
-        wav_path = work_dir / f"web-test-{self._count:03d}.wav"
-        if self.pass_quality:
-            make_sine_wav(wav_path, segments=[(65.0, 12000.0)])  # >= min duration, no silence
+    def download_audio(self, mp3_url: str, audio_id: str, work_dir: Path) -> Path:
+        wav_path = work_dir / f"{audio_id}.wav"
+        if "poor" in mp3_url:
+            make_sine_wav(wav_path, segments=[(5.0, 12000.0)])  # too short -> quality FAIL
         else:
-            make_sine_wav(wav_path, segments=[(2.0, 12000.0)])  # too short -> quality FAIL
-        return MaterialSource(
-            material_id=f"web-test-{self._count:03d}",
-            title="Fake episode",
-            audio_path=str(wav_path),
-            transcript="One sentence here. Two sentences there. Three more words.",
-            source_url=f"https://example.com/ep-{self._count}",
-            source_name="Fake Source",
-            duration_seconds=65.0 if self.pass_quality else 2.0,
-            timestamped_sentences=(
-                ("One sentence here.", 0.0, 5.0),
-                ("Two sentences there.", 5.5, 12.0),
-                ("Three more words.", 12.5, 18.0),
-            ),
-        )
+            make_sine_wav(wav_path, segments=[(65.0, 12000.0)])
+        return wav_path
+
+
+def _governed_service(tmp_path: Path, provider: GovernedFakeProvider) -> MaterialSearchService:
+    service = MaterialSearchService(
+        database=make_database(tmp_path),
+        settings=make_settings(tmp_path),
+        providers=[provider],
+        asr=FakeASR(),
+    )
+    service.candidates.activate_source(
+        "default", PLATFORM, "fixture-license", "fixture-catalog", confirmed_by="TEST"
+    )
+    return service
+
+
+def test_search_next_requires_an_active_source(tmp_path: Path) -> None:
+    service = MaterialSearchService(
+        database=make_database(tmp_path),
+        settings=make_settings(tmp_path),
+        providers=[GovernedFakeProvider(tmp_path)],
+        asr=FakeASR(),
+    )
+    with pytest.raises(ValueError, match="SOURCE_NOT_APPROVED"):
+        service.search_next()
 
 
 def test_search_service_pipeline_with_fake_provider(tmp_path: Path) -> None:
-    database = make_database(tmp_path)
-    settings = make_settings(tmp_path)
-    provider = FakeProvider(tmp_path)
-    service = MaterialSearchService(database, settings, providers=[provider], asr=None)
+    provider = GovernedFakeProvider(tmp_path)
+    service = _governed_service(tmp_path, provider)
 
     result = service.search_next()
 
     assert result["material_id"] == "web-test-001"
     assert result["source_url"] == "https://example.com/ep-1"
-    assert result["upgrade_available"] is False
-    # Criteria: initial profile (no completed material) -> standard + slow.
-    assert provider.called_with["criteria"].duration_band == "standard"
+    assert result["source_platform"] == PLATFORM
+    # The governed source label replaces the provider's own display name.
+    assert result["source_name"] == SOURCE_LABELS[PLATFORM]
+    assert result["ingestion_status"] == "INGESTED"
+    assert result["accent"] == "en-GB"
+    assert result["cefr_level"] == "A1"
 
-    with database.connect() as connection:
+    with service.database.connect() as connection:
         material = connection.execute(
-            "SELECT source_url, source_name, duration_seconds FROM materials WHERE material_id = 'web-test-001'"
+            "SELECT source_url, source_name, duration_seconds, accent, transcript_verified "
+            "FROM materials WHERE material_id = 'web-test-001'"
         ).fetchone()
         sentences = connection.execute(
             "SELECT text, start_time, end_time FROM sentences WHERE material_id = 'web-test-001' ORDER BY sequence_no"
         ).fetchall()
     assert material["source_url"] == "https://example.com/ep-1"
-    assert material["source_name"] == "Fake Source"
+    assert material["source_name"] == SOURCE_LABELS[PLATFORM]
+    assert material["accent"] == "en-GB"
+    assert material["transcript_verified"] == 1
     assert [row["text"] for row in sentences] == [
-        "One sentence here.", "Two sentences there.", "Three more words."
+        f"Official sentence number {index} of this lesson." for index in range(1, 13)
     ]
-    assert sentences[0]["start_time"] == 0.0
-    assert sentences[2]["end_time"] == 18.0
+    assert sentences[0]["start_time"] >= 0.0
+    assert all(
+        current["start_time"] >= previous["end_time"]
+        for previous, current in zip(sentences, sentences[1:])
+    )
 
-    # Second search excludes the imported URL and uses a fresh episode.
+    # The next fetch advances to the next course item, never back to an
+    # already ingested one.
     second = service.search_next()
-    assert "https://example.com/ep-1" in provider.called_with["exclude_urls"]
     assert second["material_id"] == "web-test-002"
 
 
-def test_search_service_uses_gate_stability_for_upgrade(tmp_path: Path) -> None:
-    database = make_database(tmp_path)
-    settings = make_settings(tmp_path)
-    # One completed material with a standard-duration + slow-rate profile.
-    create_material(database, "done-001")
-    with database.connect() as connection:
+def test_search_next_never_uses_the_two_week_upgrade_rule(tmp_path: Path) -> None:
+    provider = GovernedFakeProvider(tmp_path)
+    service = _governed_service(tmp_path, provider)
+    create_material(service.database, "done-001")
+    with service.database.connect() as connection:
         connection.execute(
             "UPDATE training_progress SET current_state = 'FULLY_COMPLETED' WHERE material_id = 'done-001'"
         )
         connection.execute(
             "UPDATE materials SET duration_seconds = 900, speech_rate_wpm = 106 WHERE material_id = 'done-001'"
         )
-        # Two consecutive weekly gate passes.
+        # Two consecutive weekly gate passes would have upgraded under the old
+        # recommendation rule; the eight-week confirmation is the authority now.
         for week in ("W1", "W2"):
             connection.execute(
                 """
@@ -228,39 +300,47 @@ def test_search_service_uses_gate_stability_for_upgrade(tmp_path: Path) -> None:
                 (week,),
             )
 
-    provider = FakeProvider(tmp_path)
-    service = MaterialSearchService(database, settings, providers=[provider], asr=None)
     result = service.search_next()
-    assert result["upgrade_available"] is True
-    assert provider.called_with["criteria"].duration_band == "long"
+    assert result["upgrade_available"] is False
+    assert result["material_id"] == "web-test-001"
 
 
-def test_quality_gate_rejects_poor_audio_and_falls_through(tmp_path: Path) -> None:
-    database = make_database(tmp_path)
-    settings = make_settings(tmp_path)
-    poor = FakeProvider(tmp_path, pass_quality=False)
-    good = FakeProvider(tmp_path, pass_quality=True)
-    service = MaterialSearchService(database, settings, providers=[poor, good], asr=None)
+def test_quality_gate_rejects_poor_audio(tmp_path: Path) -> None:
+    provider = GovernedFakeProvider(
+        tmp_path,
+        [catalog_item(1, item_order=1, poor_audio=True), catalog_item(2, item_order=2)],
+    )
+    service = _governed_service(tmp_path, provider)
 
     result = service.search_next()
-    # The first provider's audio fails the quality gate; the second wins.
-    assert result["material_id"] == "web-test-001"  # good provider's first episode
-    assert result["source_url"] == "https://example.com/ep-1"
+    # The poor item is rejected outright; the next qualified item is ingested.
+    assert result["material_id"] == "web-test-002"
+    quarantined = {
+        row["provider_item_id"]: row["ingestion_status"]
+        for row in service.candidates.list_candidates("default")
+    }
+    assert quarantined == {"web-test-001": "REJECTED", "web-test-002": "INGESTED"}
 
 
 def test_skip_retires_material(tmp_path: Path) -> None:
-    database = make_database(tmp_path)
-    settings = make_settings(tmp_path)
-    provider = FakeProvider(tmp_path)
-    service = MaterialSearchService(database, settings, providers=[provider], asr=None)
+    provider = GovernedFakeProvider(tmp_path)
+    service = _governed_service(tmp_path, provider)
     result = service.search_next()
 
     skipped = service.skip(result["material_id"])
     assert skipped["status"] == "SKIPPED"
-    with database.connect() as connection:
+    with service.database.connect() as connection:
         status = connection.execute(
             "SELECT status FROM materials WHERE material_id = ?", (result["material_id"],)
         ).fetchone()["status"]
     assert status == "SKIPPED"
     with pytest.raises(KeyError):
         service.skip("no-such-material")
+
+    # The next fetch advances to the next course item; skipping never re-opens
+    # the retired one and never invents a new source.
+    second = service.search_next()
+    assert second["material_id"] == "web-test-002"
+    with pytest.raises(ValueError, match="No qualified material"):
+        service.search_next()
+

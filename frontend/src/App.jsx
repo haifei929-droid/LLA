@@ -220,7 +220,7 @@ function App() {
       .then((payload) => {
         setForm(blankMaterial)
         setShowImport(false)
-        setMessage('素材已导入，可以进入训练。')
+        setMessage('素材已导入为隔离/历史素材：可手动训练，但不进入自动选材与周测新题池。')
         refresh().then(() => openMaterial(payload.material_id)).catch(() => {})
       })
       .catch((error) => setMessage(error.message))
@@ -347,8 +347,8 @@ function App() {
         setSearching(false)
         onMaterialImported(payload.material_id)
         setMessage(payload.upgrade_available
-          ? `已获取下一篇（周测稳定，难度档已升级）。来源：${payload.source_name}`
-          : `已获取下一篇。来源：${payload.source_name}`)
+          ? `已获取下一篇（${payload.source_platform || '当前主源'}，难度暂不升级，需八周确认）。`
+          : `已获取下一篇。来源：${payload.source_platform || payload.source_name || '当前主源'}`)
       })
       .catch((error) => { setSearching(false); setMessage(error.message) })
   }
@@ -515,7 +515,7 @@ function App() {
         </section>}
 
         {view === 'candidates' && <section className="module">
-          <div className="section-heading light"><div><p className="eyebrow">候选素材（P1）</p><h2>自动获取素材</h2><p className="muted">候选先经音质三档分级与 Transcript 校验，你确认后才准备为正式素材。</p></div></div>
+          <div className="section-heading light"><div><p className="eyebrow">候选素材（P1）</p><h2>自动获取素材</h2><p className="muted">候选只来自当前已确认主源；en-US、未知口音、授权或稿音未验证的条目会被隔离并留原因，确认后才准备为正式素材。</p></div></div>
           <CandidatePanel
             stage={candidateStage}
             onStageChange={setCandidateStage}

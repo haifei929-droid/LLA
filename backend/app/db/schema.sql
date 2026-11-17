@@ -24,7 +24,24 @@ CREATE TABLE IF NOT EXISTS materials (
     part_3_start REAL,
     part_3_end REAL,
     created_at TEXT NOT NULL,
-    published_at TEXT
+    published_at TEXT,
+    source_candidate_id TEXT,
+    speed_stage TEXT NOT NULL DEFAULT 'STAGE_1',
+    prepare_status TEXT NOT NULL DEFAULT 'READY',
+    -- Source governance (LLA source governance plan). A material enters the
+    -- formal training library only with verified source evidence; everything
+    -- else stays QUARANTINED: history view and existing training records are
+    -- untouched, but new recommendation, new ingestion and the new weekly
+    -- question pool ignore it. No legacy row is backfilled with a guessed
+    -- accent.
+    source_platform TEXT,
+    source_course TEXT,
+    item_order INTEGER,
+    accent TEXT,
+    cefr_level TEXT,
+    transcript_verified INTEGER NOT NULL DEFAULT 0,
+    license_status TEXT NOT NULL DEFAULT 'UNKNOWN',
+    ingestion_status TEXT NOT NULL DEFAULT 'QUARANTINED'
 );
 
 CREATE TABLE IF NOT EXISTS sentences (
@@ -186,6 +203,28 @@ CREATE TABLE IF NOT EXISTS material_candidates (
     timestamped_sentences_json TEXT,
     created_at TEXT NOT NULL,
     expires_at TEXT NOT NULL,
+    -- Source governance: the candidate table doubles as the persistent
+    -- discovery list, so each entry keeps the identity, ordering, accent,
+    -- license, transcript and review evidence that decided its disposition.
+    source_course TEXT,
+    course_order INTEGER,
+    item_order INTEGER,
+    accent TEXT,
+    speaker_id TEXT,
+    cefr_level TEXT,
+    transcript_verified INTEGER NOT NULL DEFAULT 0,
+    license_status TEXT NOT NULL DEFAULT 'UNKNOWN',
+    license_reference TEXT,
+    ingestion_status TEXT NOT NULL DEFAULT 'PENDING',
+    source_priority INTEGER,
+    transcript_origin TEXT,
+    accent_evidence TEXT,
+    transcript_evidence TEXT,
+    reviewed_by TEXT,
+    reviewed_at TEXT,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    imported_at TEXT,
+    ingestion_result_json TEXT,
     UNIQUE(scope_id, content_fingerprint)
 );
 
