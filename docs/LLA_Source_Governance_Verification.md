@@ -1,5 +1,44 @@
 # LLA 素材来源治理：交付与验证记录
 
+## Codex 独立首轮审查（2026-11-17）
+
+目标 SHA：`9b9d98bb9b836dfb91a31b79c408262cc9135b6f`；主仓 root/HEAD/clean 已核对。
+
+CORRECTNESS: FAIL
+
+MINIMALITY: FAIL（候选表与 app_metadata 中逐条 ledger 重复存状态且不同步；须复用候选表单一事实来源）
+
+FINAL: REVIEW FAIL / VERIFY FAIL
+
+Close Recommendation: NO
+
+实测：`.venv/Scripts/python.exe -m pytest -q -p no:cacheprovider --tb=short` → 143 passed / 5 failed（34.80 秒）；`frontend` 的 `npm run build` → PASS；compileall → PASS；diff check 有测试文件尾空格。pytest 退出清理有 PermissionError，未使用任何 monkeypatch。
+
+失败测试：
+- acceptance/test_p0_acceptance.py::test_weekly_fail_reinforce_retest_pass：新题池空导致 409。
+- test_material_search.py::test_search_service_pipeline_with_fake_provider、test_source_governance.py::test_course_order_cannot_be_bypassed：口音存成 en-gb 而非标准 en-GB。
+- test_material_search.py::test_quality_gate_rejects_poor_audio、test_source_governance.py::test_quarantine_reasons_and_blind_listing：拒绝条目未写入候选清单。
+
+独立离线复现（使用 test_source_governance 的 FakeGovernedProvider/item/_service 和 tempfile，每例独立 DB）：
+1. assess_disposition(item('au', accent='en-AU')) 返回 ELIGIBLE。必须只允许规范 en-GB；其他非明确英音及任意字符串均待审/排除，prepare 与周测亦须严格白名单。
+2. provider.items=[B1,A1]，max_results=1 → 首次下载和候选都是 B1。必须先持久发现完整清单，再按 CEFR、course_order、item_order 排队，禁止按 provider 输入和音质重新排名。当前 _course_key 在 course_order 前按课程名排序也错误。
+3. 空目录生成 report 后，新添合格条目并 search，使用旧 report_id 仍能切到 BRITISH_COUNCIL。切换必须在同事务重算当前清单/版本，任何发现、审核、入库变化均使旧报告失效。
+4. known_total=5、max_results=3，准备前三条后 report 为 discovered=3 / COMPLETE，且允许切换。完整目录声明不等于条目已全部发现/处理；known_total 未知、不相等、有游标、PENDING、临时失败或可处理项都不能切换。
+5. speed_stage=STAGE_1 可直接 prepare B1；speed_stage 来自客户端且无 profile 复验。发现可以跨等级，入库/新任务须遵守后端实际难度及用户升级确认，不能让 UI 参数绕过八周机制。CEFR 与语速不是同义字段，明确记录学习等级许可，未确认提升不得提前投放。
+6. default scope 可激活 50LANGUAGES，other scope 同时激活 BRITISH_COUNCIL。主仓必须只有一个 Active Source，不能用 scope 参数绕过。
+7. license_status=UNKNOWN 条目仍调用 download_audio。任何下载前必须确认条目授权与用途，待授权项只记录，不下载。
+
+代码审查补充阻断项：
+- prepare 的校验在第一次事务，第二次写事务未复验 active cycle/审核/顺序，且使用第一次的旧 candidate 数据；应在唯一写事务中使用最新行校验并写入。material_id 不能只取 provider_item_id（不同平台常有相同课号）；须纳入平台身份。
+- 批次级 ledger 落盘会丢失中断前已发现条目，候选去重又跳过补 ledger；重复状态源导致报告不真实。复用 material_candidates 保存所有状态（未下载字段应允许 NULL），逐条写入；app_metadata 只保存周期、目录游标/版本、报告与确认。重试复用稳定来源身份和文件位置，不把过期合格项永久跳过。
+- App.jsx 仍从 materials 倒序直接取 currentMaterial，手工导入后仍自动 openMaterial 并宣称可训练；QUARANTINED 标签未形成边界。阻止新隔离素材进入新训练，保留历史已进行训练的恢复及所有记录。推荐须来自后端可用清单/顺序，不能由前端任意排除标签代替入库约束。
+- weekly 新池只排除 en-US，非 en-GB 仍可入；无 Active Source 时 OR NULL 放开所有来源，且未验 license。只允许当前有效英音来源、授权、验证条目；保持已有题目和评分/强化状态机。
+- 现有假数据的官方稿与 FakeASR 文本完全不同也被接受为 VERIFIED。不能将布尔声明代替稿音一致性校验；官方稿与独立 ASR/人工证据存在矛盾时必须待审/隔离。质量无噪音/音乐证据也不得被简单 Clear 能量统计冒充。
+
+最小修复计划修订（Codex Review Gate 返回 DSH）：上述均为原十项验收的必要修复，沿用已批准文件；额外允许修改 `backend/tests/fixtures.py` 和 `backend/tests/acceptance/test_p0_acceptance.py`，仅用于将旧周测测试输入换成经过真实治理路径的可信离线 fixture，保留原周测 fail→强化→复测、状态机与幂等断言。禁止生产测试旁路或降低验收条件。不得把“无真实适配器”作为治理缺陷的豁免。DSH 不执行 pytest 或修改权限；Codex 继续独立运行测试。
+
+修复须增加以上独立复现的负例（特别是 stale report、少发现两条、未知授权零下载、全局源锁、B1 先到、en-AU、并发切换与 prepare），交付新 SHA 后重新 Review / Verify。
+
 日期：2026-11-17。工作目录 `D:\codex\LLA`。基线 `b8d6bca9b4dd93d33fc068943bbb6123641672bf`（clean）。
 
 ## 1. 交付身份
