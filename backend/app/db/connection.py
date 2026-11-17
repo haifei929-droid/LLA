@@ -108,6 +108,64 @@ class Database:
         ):
             if column not in columns:
                 connection.execute(f"ALTER TABLE material_candidates ADD COLUMN {column} {definition}")
+        Database._relax_candidate_columns(connection)
+
+    @staticmethod
+    def _relax_candidate_columns(connection: sqlite3.Connection) -> None:
+        """Let a discovery-only candidate row keep NULL where it has no evidence.
+
+        The candidate table is the persistent discovery list, so an entry that
+        was rejected or is still awaiting a download has no transcript, no
+        duration and no quality grade. SQLite cannot drop a NOT NULL
+        constraint in place, so the table is rebuilt once: every existing row
+        and value is copied first, the identifiers that were table constraints
+        are recreated as indexes afterwards, and a second initialize() sees the
+        relaxed definition and does nothing.
+        """
+        nullable = ("transcript", "duration_seconds", "audio_quality", "transcript_status")
+        info = list(connection.execute("PRAGMA table_info(material_candidates)"))
+        if not any(row["name"] in nullable and row["notnull"] for row in info):
+            return
+        definitions = []
+        for row in info:
+            parts = [f'"{row["name"]}"', row["type"] or "TEXT"]
+            if row["notnull"] and row["name"] not in nullable:
+                parts.append("NOT NULL")
+            if row["dflt_value"] is not None:
+                parts.append(f"DEFAULT {row['dflt_value']}")
+            if row["pk"]:
+                parts.append("PRIMARY KEY")
+            definitions.append(" ".join(parts))
+        names = ", ".join(f'"{row["name"]}"' for row in info)
+        connection.execute("CREATE TABLE material_candidates_relaxed (\n" + ",\n".join(definitions) + "\n)")
+        connection.execute(
+            f"INSERT INTO material_candidates_relaxed ({names}) SELECT {names} FROM material_candidates"
+        )
+        connection.execute("DROP TABLE material_candidates")
+        connection.execute("ALTER TABLE material_candidates_relaxed RENAME TO material_candidates")
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_candidates_batch "
+            "ON material_candidates(search_batch_id, candidate_status)"
+        )
+        # The previous table declared (scope_id, content_fingerprint) as a table
+        # constraint; recreate it as a unique index, falling back to a plain
+        # index when legacy rows already collide (history is never deleted).
+        try:
+            connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_material_candidates_fingerprint "
+                "ON material_candidates(scope_id, content_fingerprint)"
+            )
+            fingerprint_state = "ENFORCED"
+        except sqlite3.IntegrityError:
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_material_candidates_fingerprint "
+                "ON material_candidates(scope_id, content_fingerprint)"
+            )
+            fingerprint_state = "SKIPPED_DUPLICATES_PRESENT"
+        connection.execute(
+            "INSERT OR REPLACE INTO app_metadata(key, value) VALUES ('candidate_fingerprint_unique', ?)",
+            (fingerprint_state,),
+        )
 
     @staticmethod
     def _ensure_source_identity_index(connection: sqlite3.Connection) -> None:

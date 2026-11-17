@@ -114,6 +114,17 @@ def list_materials(request: Request) -> list[dict[str, object]]:
     return request.app.state.material_store.list()
 
 
+@router.get("/materials/available")
+def list_available_materials(request: Request) -> list[dict[str, object]]:
+    """Backend-authoritative material list for the training surface.
+
+    Only governed (INGESTED) material or material with training already in
+    flight is returned; the frontend must not decide this by filtering a
+    governance label itself.
+    """
+    return request.app.state.material_store.available()
+
+
 @router.get("/materials/search")
 def search_materials(request: Request, q: str = "") -> list[dict[str, object]]:
     return request.app.state.material_store.search(q)
@@ -174,6 +185,7 @@ def _p1_error(exc: MaterialSelectionError | DifficultyError) -> HTTPException:
         "TRANSCRIPT_UNVERIFIED",
         "CEFR_UNVERIFIED",
         "NO_QUALIFIED_CANDIDATE",
+        "LEARNING_LEVEL_NOT_CONFIRMED",
     ) else 400
     return HTTPException(status_code=status, detail={"code": exc.code, "message": str(exc)})
 

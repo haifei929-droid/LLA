@@ -153,8 +153,10 @@ class WeeklyAssessmentService:
         item).
 
         Source governance: the pool only contains verified, ingested material
-        that matches the active training source. Quarantined/historical or
-        unverified material never backfills the pool; when nothing qualifies
+        that matches the active training source, with the canonical en-GB
+        accent, cleared license and a verified transcript. Quarantined,
+        historical, non-British, unauthorized or unverified material never
+        backfills the pool, and when no source is active the pool stays empty:
         the reason is surfaced instead of silently sampling the whole library.
         Already generated items are never rewritten.
         """
@@ -165,6 +167,12 @@ class WeeklyAssessmentService:
         # Read the active source before opening the writing connection: the
         # same connection must never be nested inside a write transaction.
         active_platform = active_source_platform(self.database)
+        if active_platform is None:
+            raise ValueError(
+                "No verified material matches the active training source; "
+                "no source is active, so the weekly test pool is empty "
+                "(quarantined material is never used)"
+            )
         with self.database.connect() as connection:
             existing = connection.execute(
                 "SELECT COUNT(*) AS n FROM weekly_test_items WHERE week_id = ? AND kind = 'TEST'",
@@ -180,13 +188,13 @@ class WeeklyAssessmentService:
                       JOIN materials m ON m.material_id = s.material_id
                      WHERE m.ingestion_status = 'INGESTED'
                        AND m.transcript_verified = 1
-                       AND m.accent IS NOT NULL
-                       AND lower(m.accent) NOT IN ('en-us', 'en_us', 'mixed', 'unknown')
+                       AND m.accent = 'en-GB'
+                       AND m.license_status = 'CLEARED'
                        AND (m.prepare_status IS NULL OR m.prepare_status = 'READY')
-                       AND (? IS NULL OR m.source_platform = ?)
+                       AND m.source_platform = ?
                      ORDER BY s.material_id, s.sequence_no
                     """,
-                    (active_platform, active_platform),
+                    (active_platform,),
                 ).fetchall()
             )
         if existing:

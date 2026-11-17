@@ -122,6 +122,37 @@ class MaterialStore:
     def list(self) -> list[dict[str, object]]:
         return self.search("")
 
+    def available(self) -> list[dict[str, object]]:
+        """Materials the training surface may open.
+
+        Governance boundary: a new material enters training only when it was
+        ingested through the governed path (``INGESTED``). A material that
+        already has training in flight keeps its resume path -- history is never
+        taken away -- while a freshly imported ``QUARANTINED`` material can
+        still be listed and inspected but never starts a new training session.
+        The set is decided by the backend, not by a label the UI filters on.
+        """
+        with self.database.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT m.material_id, m.title, m.duration_seconds, m.speech_rate_wpm, m.status,
+                       p.current_state, m.ingestion_status, m.source_platform, m.accent,
+                       m.transcript_verified
+                  FROM materials m
+                  LEFT JOIN training_progress p ON p.material_id = m.material_id
+                 WHERE (
+                        m.ingestion_status = 'INGESTED'
+                        AND (m.prepare_status IS NULL OR m.prepare_status = 'READY')
+                       )
+                    OR (
+                        p.current_state IS NOT NULL
+                        AND p.current_state <> 'READY_FIRST_LISTEN'
+                       )
+                 ORDER BY m.created_at DESC, m.material_id
+                """
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def search(self, query: str) -> list[dict[str, object]]:
         term = f"%{query.strip()}%"
         with self.database.connect() as connection:

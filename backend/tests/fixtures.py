@@ -71,6 +71,45 @@ def create_material(
     return store
 
 
+#: Platform used by the offline fixtures as the authorized active source.
+GOVERNED_PLATFORM = "50LANGUAGES"
+
+
+def govern_material(database: Database, *material_ids: str) -> None:
+    """Mark fixture materials as ingested from the active, authorized source.
+
+    The weekly question pool only accepts verified material that matches the
+    active training source (canonical en-GB accent, cleared license, verified
+    transcript). A fixture standing in for real library material therefore has
+    to *carry* that evidence and the source has to be *active*: this helper
+    activates the source through the production service and attaches the
+    governance evidence, instead of weakening the pool query.
+    """
+    from app.core.material_candidates import MaterialCandidateService
+
+    service = MaterialCandidateService(database, database.settings)
+    if service.active_source("default") is None:
+        service.activate_source(
+            "default",
+            GOVERNED_PLATFORM,
+            "fixture-license",
+            "fixture-catalog",
+            confirmed_by="FIXTURE",
+        )
+    with database.connect() as connection:
+        for material_id in material_ids:
+            connection.execute(
+                """
+                UPDATE materials
+                   SET ingestion_status = 'INGESTED', transcript_verified = 1,
+                       accent = 'en-GB', license_status = 'CLEARED',
+                       source_platform = ?, cefr_level = 'A1'
+                 WHERE material_id = ?
+                """,
+                (GOVERNED_PLATFORM, material_id),
+            )
+
+
 def sentence_ids(material_id: str, count: int = 9) -> list[str]:
     return [f"{material_id}-sentence-{index:03d}" for index in range(1, count + 1)]
 

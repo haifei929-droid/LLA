@@ -131,16 +131,21 @@ def test_bbc_provider_skips_episode_without_downloadable_audio(monkeypatch, tmp_
 
 
 class FakeASR:
-    """Sentence-shaped deterministic segments covering the fixture audio."""
+    """Sentence-shaped deterministic segments covering the fixture audio.
+
+    The text matches the fixture's official script on purpose: an official
+    transcript that an independent ASR pass contradicts is quarantined, so the
+    positive pipeline fixtures must be self-consistent.
+    """
 
     def transcribe(self, audio_path: str) -> list[RecognizedSegment]:
         return [
             RecognizedSegment(
-                text=f"Sample sentence number {index} has enough words.",
-                start_time=index * 1.9,
-                end_time=index * 1.9 + 1.8,
+                text=f"Official sentence number {index} of this lesson.",
+                start_time=(index - 1) * 5.4,
+                end_time=(index - 1) * 5.4 + 5.35,
             )
-            for index in range(32)
+            for index in range(1, 13)
         ]
 
 
@@ -240,7 +245,9 @@ def test_search_service_pipeline_with_fake_provider(tmp_path: Path) -> None:
 
     result = service.search_next()
 
-    assert result["material_id"] == "web-test-001"
+    # The material id carries the platform identity: another platform reusing
+    # the same lesson number must not collide with this material.
+    assert result["material_id"] == f"{PLATFORM}:web-test-001"
     assert result["source_url"] == "https://example.com/ep-1"
     assert result["source_platform"] == PLATFORM
     # The governed source label replaces the provider's own display name.
@@ -252,10 +259,12 @@ def test_search_service_pipeline_with_fake_provider(tmp_path: Path) -> None:
     with service.database.connect() as connection:
         material = connection.execute(
             "SELECT source_url, source_name, duration_seconds, accent, transcript_verified "
-            "FROM materials WHERE material_id = 'web-test-001'"
+            "FROM materials WHERE material_id = ?",
+            (f"{PLATFORM}:web-test-001",),
         ).fetchone()
         sentences = connection.execute(
-            "SELECT text, start_time, end_time FROM sentences WHERE material_id = 'web-test-001' ORDER BY sequence_no"
+            "SELECT text, start_time, end_time FROM sentences WHERE material_id = ? ORDER BY sequence_no",
+            (f"{PLATFORM}:web-test-001",),
         ).fetchall()
     assert material["source_url"] == "https://example.com/ep-1"
     assert material["source_name"] == SOURCE_LABELS[PLATFORM]
@@ -273,7 +282,7 @@ def test_search_service_pipeline_with_fake_provider(tmp_path: Path) -> None:
     # The next fetch advances to the next course item, never back to an
     # already ingested one.
     second = service.search_next()
-    assert second["material_id"] == "web-test-002"
+    assert second["material_id"] == f"{PLATFORM}:web-test-002"
 
 
 def test_search_next_never_uses_the_two_week_upgrade_rule(tmp_path: Path) -> None:
@@ -302,7 +311,7 @@ def test_search_next_never_uses_the_two_week_upgrade_rule(tmp_path: Path) -> Non
 
     result = service.search_next()
     assert result["upgrade_available"] is False
-    assert result["material_id"] == "web-test-001"
+    assert result["material_id"] == f"{PLATFORM}:web-test-001"
 
 
 def test_quality_gate_rejects_poor_audio(tmp_path: Path) -> None:
@@ -313,8 +322,9 @@ def test_quality_gate_rejects_poor_audio(tmp_path: Path) -> None:
     service = _governed_service(tmp_path, provider)
 
     result = service.search_next()
-    # The poor item is rejected outright; the next qualified item is ingested.
-    assert result["material_id"] == "web-test-002"
+    # The poor item is rejected outright but stays in the persisted discovery
+    # list with its reason; the next qualified item is ingested.
+    assert result["material_id"] == f"{PLATFORM}:web-test-002"
     quarantined = {
         row["provider_item_id"]: row["ingestion_status"]
         for row in service.candidates.list_candidates("default")
@@ -340,7 +350,7 @@ def test_skip_retires_material(tmp_path: Path) -> None:
     # The next fetch advances to the next course item; skipping never re-opens
     # the retired one and never invents a new source.
     second = service.search_next()
-    assert second["material_id"] == "web-test-002"
+    assert second["material_id"] == f"{PLATFORM}:web-test-002"
     with pytest.raises(ValueError, match="No qualified material"):
         service.search_next()
 

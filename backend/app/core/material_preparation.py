@@ -30,7 +30,10 @@ from app.core.material_candidates import (
     REJECTED,
     SOURCE_LABELS,
     MaterialCandidateService,
-    is_excluded_accent,
+    confirmed_learning_level,
+    is_british_accent,
+    is_level_allowed,
+    material_id_for,
     normalize_license,
 )
 from app.core.materials import MaterialStore
@@ -71,13 +74,11 @@ class MaterialPreparationService:
     def prepare(self, candidate_id: str, scope_id: str, idempotency_key: str) -> dict[str, object]:
         if not idempotency_key.strip():
             raise MaterialSelectionError(IDEMPOTENCY_CONFLICT, "idempotency_key is required")
+        # Idempotent replay is decided before expiry/source checks so a lost
+        # response can be retried safely later. It is decided again inside the
+        # writing transaction below.
         with self.database.connect() as connection:
-            candidate = connection.execute(
-                "SELECT * FROM material_candidates WHERE candidate_id = ? AND scope_id = ?",
-                (candidate_id, scope_id),
-            ).fetchone()
-            if candidate is None:
-                raise MaterialSelectionError(CANDIDATE_NOT_FOUND, f"no candidate {candidate_id}")
+            candidate = self._candidate(connection, candidate_id, scope_id)
             replayed = self._replay(connection, candidate, idempotency_key)
             if replayed is not None:
                 return replayed
@@ -85,57 +86,18 @@ class MaterialPreparationService:
                 raise MaterialSelectionError(
                     IDEMPOTENCY_CONFLICT, "candidate was selected with a different key"
                 )
-            if _is_expired(candidate["expires_at"], self.now_fn()):
-                raise MaterialSelectionError(
-                    CANDIDATE_EXPIRED, "candidate has expired; search again"
-                )
-            self._assert_eligible(candidate, scope_id, connection)
-            self._assert_course_order(candidate, scope_id, connection)
-            try:
-                aligned = decode_timestamped(candidate["timestamped_sentences_json"])
-            except (KeyError, TypeError, ValueError) as exc:
-                raise MaterialSelectionError(
-                    CANDIDATE_NOT_SELECTABLE, f"candidate timestamps are unusable: {exc}"
-                ) from exc
-            if not aligned:
-                raise MaterialSelectionError(
-                    CANDIDATE_NOT_SELECTABLE, "candidate has no aligned sentences"
-                )
+            stage = str(candidate["speed_stage"])
 
+        result: dict[str, object] | None = None
+        material_id: str | None = None
         try:
-            material = MaterialPreprocessor().process(
-                material_id=candidate["provider_item_id"],
-                title=candidate["title"],
-                audio_path=candidate["audio_path"],
-                transcript=candidate["transcript"],
-                timestamped_sentences=[
-                    TimestampedSentence(text=text, start_time=start, end_time=end)
-                    for text, start, end in aligned
-                ],
-            )
-        except Exception as exc:
-            # Nothing was written yet; the candidate stays recoverable.
-            self._record_failure(candidate_id, scope_id, exc)
-            raise MaterialSelectionError(
-                "PREPARE_FAILED", f"prepare failed; candidate kept recoverable: {exc}"
-            ) from exc
-
-        result = {
-            "material_id": material.material_id,
-            "prepare_status": "READY",
-            "reused": False,
-        }
-        try:
+            # One write transaction: the candidate row is re-read and every
+            # governance check is re-run against the *latest* active cycle,
+            # review state and course order, then the material is built from
+            # that same row and committed together with its ingestion state.
+            # There is no second, differently-validated window.
             with self.database.connect() as connection:
-                # Re-read inside the writing transaction: a concurrent prepare
-                # either already committed the material (reused) or claimed a
-                # different idempotency key (conflict).
-                current = connection.execute(
-                    "SELECT * FROM material_candidates WHERE candidate_id = ? AND scope_id = ?",
-                    (candidate_id, scope_id),
-                ).fetchone()
-                if current is None:
-                    raise MaterialSelectionError(CANDIDATE_NOT_FOUND, f"no candidate {candidate_id}")
+                current = self._candidate(connection, candidate_id, scope_id)
                 replayed = self._replay(connection, current, idempotency_key)
                 if replayed is not None:
                     return replayed
@@ -143,35 +105,74 @@ class MaterialPreparationService:
                     raise MaterialSelectionError(
                         IDEMPOTENCY_CONFLICT, "candidate was selected with a different key"
                     )
+                if _is_expired(current["expires_at"], self.now_fn()):
+                    raise MaterialSelectionError(
+                        CANDIDATE_EXPIRED, "candidate has expired; search again"
+                    )
+                self._assert_eligible(current, scope_id, connection)
+                self._assert_course_order(current, scope_id, connection)
+                try:
+                    aligned = decode_timestamped(current["timestamped_sentences_json"])
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise MaterialSelectionError(
+                        CANDIDATE_NOT_SELECTABLE, f"candidate timestamps are unusable: {exc}"
+                    ) from exc
+                if not aligned:
+                    raise MaterialSelectionError(
+                        CANDIDATE_NOT_SELECTABLE, "candidate has no aligned sentences"
+                    )
+                stage = str(current["speed_stage"])
                 existing = self._existing_material(connection, current)
                 if existing is not None:
                     self._mark_ingested(connection, current, existing, idempotency_key, reused=True)
-                    return {"material_id": existing, "prepare_status": "READY", "reused": True}
+                    return {
+                        "material_id": existing,
+                        "prepare_status": "READY",
+                        "reused": True,
+                    }
+                material = MaterialPreprocessor().process(
+                    material_id=material_id_for(
+                        str(current["provider"]), str(current["provider_item_id"])
+                    ),
+                    title=current["title"],
+                    audio_path=current["audio_path"],
+                    transcript=current["transcript"],
+                    timestamped_sentences=[
+                        TimestampedSentence(text=text, start_time=start, end_time=end)
+                        for text, start, end in aligned
+                    ],
+                )
                 self.store.insert(
                     connection,
                     material,
                     source={
-                        "source_type": candidate["provider"],
+                        "source_type": current["provider"],
                         "source_name": SOURCE_LABELS.get(
-                            str(candidate["provider"]), str(candidate["provider"])
+                            str(current["provider"]), str(current["provider"])
                         ),
-                        "source_url": candidate["source_url"],
+                        "source_url": current["source_url"],
                         "source_candidate_id": candidate_id,
-                        "speed_stage": candidate["speed_stage"],
+                        "speed_stage": current["speed_stage"],
                         "prepare_status": "READY",
                     },
                     governance={
-                        "source_platform": candidate["provider"],
-                        "source_course": candidate["source_course"],
-                        "item_order": candidate["item_order"],
-                        "accent": candidate["accent"],
-                        "cefr_level": candidate["cefr_level"],
-                        "transcript_verified": candidate["transcript_verified"],
-                        "license_status": candidate["license_status"],
+                        "source_platform": current["provider"],
+                        "source_course": current["source_course"],
+                        "item_order": current["item_order"],
+                        "accent": current["accent"],
+                        "cefr_level": current["cefr_level"],
+                        "transcript_verified": current["transcript_verified"],
+                        "license_status": current["license_status"],
                         "ingestion_status": "INGESTED",
                     },
                 )
                 self._mark_ingested(connection, current, material.material_id, idempotency_key)
+                material_id = material.material_id
+                result = {
+                    "material_id": material.material_id,
+                    "prepare_status": "READY",
+                    "reused": False,
+                }
         except MaterialSelectionError:
             raise
         except Exception as exc:
@@ -182,16 +183,16 @@ class MaterialPreparationService:
                 "PREPARE_FAILED", f"prepare failed; candidate kept recoverable: {exc}"
             ) from exc
 
-        if self.history is not None:
+        if self.history is not None and material_id is not None:
             self.history.record(
                 "default" if scope_id is None else scope_id,
                 "MATERIAL_PREPARED",
-                stage_before=candidate["speed_stage"],
-                stage_after=candidate["speed_stage"],
-                source_record_ids=[candidate_id, material.material_id],
+                stage_before=stage,
+                stage_after=stage,
+                source_record_ids=[candidate_id, material_id],
                 reason="candidate prepared into a READY material",
             )
-        return result
+        return result  # type: ignore[return-value]
 
     def prepare_next(self, scope_id: str, idempotency_key: str) -> dict[str, object]:
         """Ingest the next qualified item of the active source, nothing else."""
@@ -207,6 +208,16 @@ class MaterialPreparationService:
     # Governance checks
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _candidate(connection, candidate_id: str, scope_id: str):
+        candidate = connection.execute(
+            "SELECT * FROM material_candidates WHERE candidate_id = ? AND scope_id = ?",
+            (candidate_id, scope_id),
+        ).fetchone()
+        if candidate is None:
+            raise MaterialSelectionError(CANDIDATE_NOT_FOUND, f"no candidate {candidate_id}")
+        return candidate
+
     def _assert_eligible(self, candidate, scope_id: str, connection) -> None:
         active = self.governance.active_source(scope_id, connection=connection)
         if active is None:
@@ -215,9 +226,23 @@ class MaterialPreparationService:
             raise MaterialSelectionError(
                 "SOURCE_NOT_APPROVED", "candidate belongs to a non-active source"
             )
-        if is_excluded_accent(candidate["accent"]):
+        if not is_british_accent(candidate["accent"]):
             raise MaterialSelectionError(
-                "ACCENT_NOT_ELIGIBLE", "en-US material cannot enter the formal training library"
+                "ACCENT_NOT_ELIGIBLE",
+                "only the canonical en-GB accent can enter the formal training library",
+            )
+        # Discovery level is not learning eligibility: the confirmed CEFR
+        # ceiling of the existing eight-week mechanism caps what may be
+        # ingested, never a client-supplied stage. Checked before the queue
+        # state so a deferred higher-level item reports the real reason.
+        ceiling = confirmed_learning_level(connection, scope_id)
+        if str(candidate["cefr_level"] or "").upper() in CEFR_ORDER and not is_level_allowed(
+            candidate["cefr_level"], ceiling
+        ):
+            raise MaterialSelectionError(
+                "LEARNING_LEVEL_NOT_CONFIRMED",
+                f"candidate level {candidate['cefr_level']} exceeds the confirmed "
+                f"learning level {ceiling}; the eight-week confirmation must unlock it first",
             )
         status = candidate["ingestion_status"]
         if status == PENDING_REVIEW:
@@ -241,7 +266,7 @@ class MaterialPreparationService:
             raise MaterialSelectionError(CANDIDATE_NOT_SELECTABLE, "candidate quality is Poor")
         if normalize_license(candidate["license_status"]) != LICENSE_CLEARED:
             raise MaterialSelectionError("LICENSE_UNVERIFIED", "source license is not cleared")
-        if candidate["cefr_level"] not in CEFR_ORDER:
+        if str(candidate["cefr_level"] or "").upper() not in CEFR_ORDER:
             raise MaterialSelectionError("CEFR_UNVERIFIED", "candidate CEFR level is not verified")
         if not candidate["transcript_verified"]:
             raise MaterialSelectionError(
@@ -316,6 +341,12 @@ class MaterialPreparationService:
         idempotency_key: str,
         reused: bool = False,
     ) -> None:
+        """Record the ingestion on the candidate row (the single state record).
+
+        Called inside the ingestion transaction, so the candidate state and the
+        formal material are committed together. There is no second per-item
+        ledger that could disagree with the material.
+        """
         payload = {
             "material_id": material_id,
             "prepare_status": "READY",
@@ -337,14 +368,6 @@ class MaterialPreparationService:
                 json.dumps(payload, sort_keys=True),
                 candidate["candidate_id"],
             ),
-        )
-        self.governance.mark_ingested(
-            connection,
-            scope_id=str(candidate["scope_id"]),
-            platform=str(candidate["provider"]),
-            item_id=str(candidate["provider_item_id"]),
-            material_id=material_id,
-            now=now,
         )
         connection.execute("UPDATE materials SET ingestion_status = 'INGESTED' WHERE material_id = ? AND ingestion_status <> 'INGESTED'", (material_id,))
 

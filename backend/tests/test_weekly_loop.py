@@ -20,7 +20,13 @@ from app import main as main_module
 from app.core.learning_time import LearningTimeService
 from app.core.weekly import WeeklyAssessmentService
 from app.db.connection import Database
-from tests.fixtures import DEFAULT_SENTENCES, create_material, make_database, make_settings
+from tests.fixtures import (
+    DEFAULT_SENTENCES,
+    create_material,
+    govern_material,
+    make_database,
+    make_settings,
+)
 
 NOW = datetime(2026, 8, 26, 10, 0, 0, tzinfo=UTC)  # Wednesday of ISO week 2026-W35
 
@@ -37,24 +43,15 @@ def _log_training(database: Database, tmp_path: Path, *activities: str) -> None:
 
 
 def _govern(database: Database, *material_ids: str) -> None:
-    """Mark fixture materials as verified library entries.
+    """Mark fixture materials as verified entries of the active source.
 
-    The new weekly pool only uses verified, ingested material (source
-    governance). These fixtures stand in for material that already passed
-    accent/license/transcript verification, so the pool tests can keep using
-    them without weakening any other assertion.
+    The new weekly pool only uses verified, ingested material that matches the
+    active training source (canonical en-GB, cleared license, verified
+    transcript). These fixtures stand in for material that already passed that
+    governance path, so the pool tests keep using them without weakening any
+    other assertion.
     """
-    with database.connect() as connection:
-        for material_id in material_ids:
-            connection.execute(
-                """
-                UPDATE materials
-                   SET ingestion_status = 'INGESTED', transcript_verified = 1,
-                       accent = 'en-GB', source_platform = 'PRESET', cefr_level = 'A1'
-                 WHERE material_id = ?
-                """,
-                (material_id,),
-            )
+    govern_material(database, *material_ids)
 
 
 def test_test_type_follows_weekly_training(tmp_path: Path) -> None:

@@ -89,10 +89,16 @@ class FlakyDownloadProvider:
 
 
 class SimpleASR:
+    """Deterministic ASR output that agrees with the fixture's official script."""
+
     def transcribe(self, audio_path: str) -> list[RecognizedSegment]:
         return [
-            RecognizedSegment(text=f"Sample sentence number {index} with enough words here.", start_time=index * 2.0, end_time=index * 2.0 + 1.8)
-            for index in range(30)
+            RecognizedSegment(
+                text=f"Official sentence number {index} of this lesson.",
+                start_time=(index - 1) * 5.4,
+                end_time=(index - 1) * 5.4 + 5.35,
+            )
+            for index in range(1, 13)
         ]
 
 
@@ -278,21 +284,53 @@ def test_f4_concurrent_duplicate_evaluation_never_500s(tmp_path: Path) -> None:
     assert difficulty.get_profile("default")["consecutive_pass_weeks"] == 1
 
 
-# ------------------------- F5: ranking & audit -------------------------
+# ------------------------- F5: ordering & audit -------------------------
 
-def test_f5_ranking_uses_all_four_dimensions(tmp_path: Path) -> None:
+def test_f5_course_order_is_not_reranked_by_quality_or_rate(tmp_path: Path) -> None:
+    """Discovery persists the catalogue and processes it in course order.
+
+    The old pipeline re-ranked by audio grade, duration and speech rate, which
+    let a later lesson jump the platform course order. Order is now the
+    platform's own: an earlier lesson with a weaker grade still goes first.
+    """
     database = make_database(tmp_path)
-    service = MaterialCandidateService(database, make_settings(tmp_path))
-    candidates = [
-        {"candidate_id": "a", "audio_quality": "Clear", "transcript_status": "COMPLETE", "duration_seconds": 110.0, "speech_rate_wpm": 140.0},
-        {"candidate_id": "b", "audio_quality": "Clear", "transcript_status": "COMPLETE", "duration_seconds": 90.0, "speech_rate_wpm": 110.0},
-        {"candidate_id": "c", "audio_quality": "Acceptable", "transcript_status": "COMPLETE", "duration_seconds": 100.0, "speech_rate_wpm": 120.0},
-        {"candidate_id": "d", "audio_quality": "Clear", "transcript_status": "INCOMPLETE", "duration_seconds": 100.0, "speech_rate_wpm": 120.0},
-    ]
-    ranked = service._rank(candidates, 1.0, 2.0, "STAGE_1")
-    # Clear+COMPLETE before Clear+INCOMPLETE; Acceptable only tops up when
-    # Clear < 3 (here three Clears fill the quota, so 'c' is excluded).
-    assert [c["candidate_id"] for c in ranked] == ["b", "a", "d"]
+    provider = FlakyDownloadProvider(tmp_path, fail_times=0)
+    # The catalogue surfaces the second lesson first and with better numbers.
+    items = provider.catalog_items()
+    better = dict(items[0])
+    better.update(
+        {
+            "source_item_id": "flaky-2",
+            "source_url": "https://voa.example/a/2.html",
+            "audio_url": "https://voa.example/a2.mp3",
+            "item_order": 2,
+            "duration_seconds": 65.0,
+        }
+    )
+    weaker = dict(items[0])
+    weaker.update(
+        {
+            "source_item_id": "flaky-1",
+            "item_order": 1,
+            "duration_seconds": 110.0,
+        }
+    )
+    provider.catalog_items = lambda: [better, weaker]  # type: ignore[method-assign]
+    provider.catalog_info = lambda: {  # type: ignore[method-assign]
+        "catalog_complete": True,
+        "known_total": 2,
+        "has_cursor": False,
+        "catalog_scope": "fixture",
+    }
+    service = MaterialCandidateService(
+        database, make_settings(tmp_path), provider=provider, asr=SimpleASR(),
+        quality=AudioQualityAnalyzer(QualityThresholds(min_duration_seconds=30.0)),
+        now_fn=lambda: NOW,
+    )
+    _activate(service)
+    result = service.search(scope_id="default", speed_stage="STAGE_1")
+    assert [c["provider_item_id"] for c in result["candidates"]] == ["flaky-1", "flaky-2"]
+    assert service.next_qualified("default")["provider_item_id"] == "flaky-1"
 
 
 def test_f5_search_audit_is_persisted(tmp_path: Path) -> None:

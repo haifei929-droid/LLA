@@ -85,20 +85,27 @@ class FakeVOADeepProvider:
         if kind == "clear":
             make_sine_wav(wav, segments=[(65.0, 12000.0), (1.0, 0.0)])
         elif kind == "acceptable":
-            # Low SNR: loud noise floor -> Acceptable band.
-            make_sine_wav(wav, segments=[(65.0, 12000.0), (60.0, 2000.0)])
+            # Low SNR: a loud-ish noise floor keeps the grade below Clear.
+            make_sine_wav(wav, segments=[(65.0, 12000.0), (1.0, 600.0)])
         else:
             make_sine_wav(wav, segments=[(5.0, 12000.0)])  # too short -> Poor
         return wav
 
 
 class FakeASR:
+    """Deterministic ASR output that agrees with the fixture's official script."""
+
     def transcribe(self, audio_path: str) -> list[RecognizedSegment]:
         # Deterministic segments spanning the audio length so transcript
-        # validation passes coverage checks.
+        # validation passes coverage checks; the wording matches the official
+        # script so the official/ASR agreement check is honest.
         return [
-            RecognizedSegment(text=f"Sample sentence number {index} with enough words here.", start_time=index * 2.0, end_time=index * 2.0 + 1.8)
-            for index in range(30)
+            RecognizedSegment(
+                text=f"Official sentence number {index} of this lesson.",
+                start_time=(index - 1) * 5.4,
+                end_time=(index - 1) * 5.4 + 5.35,
+            )
+            for index in range(1, 13)
         ]
 
 
@@ -146,25 +153,35 @@ def test_search_filters_ranks_and_creates_candidates(tmp_path: Path) -> None:
     assert result["rejection_summary"].get("duration_out_of_range", 0) >= 1
     assert result["rejection_summary"].get("duration_missing", 0) >= 1
     assert result["rejection_summary"].get("quality_poor", 0) >= 1
-    # Clear ranks before Acceptable.
-    if len(candidates) >= 2:
-        assert candidates[0]["audio_quality"] == "Clear"
+    # Course order (item order) decides, never the audio grade: the first
+    # catalog entry is offered first.
+    assert candidates[0]["provider_item_id"] == "item-1"
+    assert [c["provider_item_id"] for c in candidates] == ["item-1", "item-3"]
 
     with database.connect() as connection:
-        rows = connection.execute("SELECT COUNT(*) AS n FROM material_candidates").fetchone()
+        rows = connection.execute(
+            "SELECT ingestion_status, COUNT(*) AS n FROM material_candidates GROUP BY ingestion_status"
+        ).fetchall()
         reports = connection.execute("SELECT COUNT(*) AS n FROM audio_quality_reports").fetchone()
-    assert rows["n"] == len(candidates)
-    assert reports["n"] == len(candidates)
+    statuses = {row["ingestion_status"]: row["n"] for row in rows}
+    # The whole discovered catalog is persisted as the single source of truth,
+    # including rejected and out-of-scope entries.
+    assert sum(statuses.values()) == 5
+    assert statuses.get("ELIGIBLE") == len(candidates)
+    assert statuses.get("REJECTED") == 1
+    assert statuses.get("OUT_OF_SCOPE") >= 1
+    assert reports["n"] >= 1
 
 
 def test_search_dedupes_by_fingerprint(tmp_path: Path) -> None:
     database, service = _service(tmp_path)
     service.search(scope_id="default", speed_stage="STAGE_1", target_duration_min=DUR_MIN, target_duration_max=DUR_MAX)
     second = service.search(scope_id="default", speed_stage="STAGE_1", target_duration_min=DUR_MIN, target_duration_max=DUR_MAX)
-    assert second["rejection_summary"].get("duplicate", 0) >= 1
+    assert second["rejection_summary"].get("duplicate", 0) == 5
     with database.connect() as connection:
         count = connection.execute("SELECT COUNT(*) AS n FROM material_candidates").fetchone()["n"]
-    assert count <= 3
+    assert count == 5, "a re-run must never duplicate a discovered entry"
+    assert [c["provider_item_id"] for c in second["candidates"]] == ["item-1", "item-3"]
 
 
 def test_prepare_is_idempotent_and_recoverable(tmp_path: Path) -> None:

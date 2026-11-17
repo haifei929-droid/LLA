@@ -16,12 +16,14 @@ const DISPOSITION_LABELS = {
 const REASON_LABELS = {
   ACCENT_EXCLUDED_EN_US: '英音优先：en-US 直接排除',
   ACCENT_UNVERIFIED: '口音未验证',
+  ACCENT_NOT_UK: '非英音口音，待人工确认',
   LICENSE_UNVERIFIED: '授权未确认',
   CEFR_UNVERIFIED: 'CEFR 未标注',
   TRANSCRIPT_UNVERIFIED: '稿音未验证',
+  TRANSCRIPT_CONTRADICTED: '官方稿与独立 ASR 明显矛盾，待审',
   TRANSCRIPT_MISSING: '缺少文字稿',
   TRANSCRIPT_INCOMPLETE: '文字稿不完整',
-  TRANSCRIPT_MISMATCHED: '稿音不匹配',
+  TRANSCRIPT_MISMATCHED: '稿音对不上（时间轴/内容）',
   QUALITY_POOR: '音质不合格',
   DURATION_OUT_OF_SCOPE: '时长不在本次范围',
   DURATION_MISSING: '缺少时长',
@@ -29,10 +31,20 @@ const REASON_LABELS = {
   ASR_FAILED: '转录失败（可重试）',
   AUDIO_UNREADABLE: '音频无法解码（可重试）',
   REVIEW_REJECTED: '人工判定不合格',
+  LEARNING_LEVEL_NOT_CONFIRMED: '超出已确认学习等级（需八周确认）',
 }
 
 function reasonText(code) {
   return code ? REASON_LABELS[code] || code : ''
+}
+
+const LEVEL_ORDER = { A1: 1, A2: 2, B1: 3 }
+
+function levelWithin(level, ceiling) {
+  const required = LEVEL_ORDER[level]
+  const allowed = LEVEL_ORDER[ceiling]
+  if (!required || !allowed) return false
+  return required <= allowed
 }
 
 function CandidatePanel({ stage, onStageChange, onMessage, onPrepared }) {
@@ -153,8 +165,11 @@ function CandidatePanel({ stage, onStageChange, onMessage, onPrepared }) {
 
   const active = sourceState?.active_source
   const reportData = sourceState?.last_report
+  const learningLevel = active?.learning_level || sourceState?.learning_level || 'A1'
   const pendingReview = candidates.filter((item) => item.ingestion_status === 'PENDING_REVIEW')
   const eligible = candidates.filter((item) => item.ingestion_status === 'ELIGIBLE')
+  const deferred = candidates.filter((item) => item.ingestion_status === 'PENDING'
+    && ['A2', 'B1'].includes(item.cefr_level) && !levelWithin(item.cefr_level, learningLevel))
   const blocked = candidates.filter((item) => ['REJECTED', 'RETRYABLE_FAILED', 'UNAVAILABLE'].includes(item.ingestion_status))
 
   return (
@@ -163,6 +178,7 @@ function CandidatePanel({ stage, onStageChange, onMessage, onPrepared }) {
       <div className="weekly-meta">
         <span>当前主源：{active ? `${active.platform} · 周期 ${active.cycle}` : '未启用'}</span>
         <span>下一平台：{sourceState?.next_platform || '—'}</span>
+        <span>学习等级上限：{learningLevel}（升级需八周确认记录）</span>
         <span>候选清单：{candidates.length} 条</span>
       </div>
 
@@ -219,6 +235,23 @@ function CandidatePanel({ stage, onStageChange, onMessage, onPrepared }) {
                 </p>
               </div>
               <button className="primary" onClick={() => prepare(candidate.candidate_id)}>选择并准备</button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {deferred.length > 0 && (
+        <div className="weekly-items">
+          <p className="muted">超出当前学习等级（已发现并记录，需八周确认升级后才可入库）</p>
+          {deferred.map((candidate) => (
+            <div className="weekly-item" key={candidate.candidate_id}>
+              <span>·</span>
+              <div className="candidate-info">
+                <strong>{candidate.title}</strong>
+                <p className="muted">
+                  {candidate.cefr_level || 'CEFR 未标'} · {reasonText(candidate.failure_code) || '等待学习等级确认'}
+                </p>
+              </div>
             </div>
           ))}
         </div>

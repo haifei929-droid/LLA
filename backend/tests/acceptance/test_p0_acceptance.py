@@ -15,7 +15,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app import main as main_module
-from tests.fixtures import DEFAULT_SENTENCES, make_settings, make_sine_wav
+from tests.fixtures import DEFAULT_SENTENCES, govern_material, make_settings, make_sine_wav
 
 REFERENCE = [(2.0, 12000.0), (0.5, 0.0)]
 
@@ -43,6 +43,11 @@ def client(tmp_path: Path):
                 },
             )
             assert response.status_code == 201, response.text
+            # A manual import is quarantined by design; this fixture stands in
+            # for material ingested from an authorized active source, so it is
+            # given exactly that governance evidence through the production
+            # service paths (the weekly pool query is untouched).
+            govern_material(test_client.app.state.database, "acc-001")
             yield test_client
     finally:
         main_module.settings = original_settings

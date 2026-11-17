@@ -39,6 +39,8 @@ const TRAINING_MODES = [
   { key: 'weekly', name: '周测', desc: '每周质量闸门与强化' },
 ]
 
+const QUARANTINED_LABEL = '隔离素材（不进入新训练与周测新题池）'
+
 function progressRank(state) {
   if (!state || COMPLETED_STATES.includes(state)) return 1
   return 0
@@ -51,6 +53,9 @@ function stateText(state) {
 function App() {
   const [health, setHealth] = useState('连接检查中…')
   const [materials, setMaterials] = useState([])
+  // The backend decides which materials may be opened for training (governed
+  // material plus training already in flight); the UI never filters by label.
+  const [available, setAvailable] = useState([])
   const [view, setView] = useState('home')
   const [candidateStage, setCandidateStage] = useState('STAGE_1')
   const [query, setQuery] = useState('')
@@ -69,13 +74,19 @@ function App() {
   const refresh = () => {
     setLoading(true)
     setHomeError('')
-    return fetch('/api/materials')
-      .then((response) => {
+    return Promise.all([
+      fetch('/api/materials').then((response) => {
         if (!response.ok) throw new Error('materials')
         return response.json()
-      })
-      .then((payload) => {
+      }),
+      fetch('/api/materials/available').then((response) => {
+        if (!response.ok) throw new Error('available')
+        return response.json()
+      }),
+    ])
+      .then(([payload, availablePayload]) => {
         setMaterials(payload)
+        setAvailable(availablePayload)
         setLoading(false)
         return payload
       })
@@ -100,9 +111,10 @@ function App() {
       })
   }, [])
 
-  // 当前训练素材：优先最近一个进行中的素材，否则最近一篇（可能已完成）。
-  const inProgress = materials.filter((material) => material.current_state && !COMPLETED_STATES.includes(material.current_state))
-  const currentMaterial = inProgress[0] || materials[0] || null
+  // 当前训练素材：只在后端给出的可用清单内选择。优先最近一个进行中的素材，
+  // 否则最近一篇已完成/已入库素材；隔离且未开始训练的素材不会出现在这里。
+  const inProgress = available.filter((material) => material.current_state && !COMPLETED_STATES.includes(material.current_state))
+  const currentMaterial = inProgress[0] || available[0] || null
   const currentCompleted = currentMaterial ? COMPLETED_STATES.includes(currentMaterial.current_state) : false
 
   const search = (event) => {
@@ -220,14 +232,32 @@ function App() {
       .then((payload) => {
         setForm(blankMaterial)
         setShowImport(false)
-        setMessage('素材已导入为隔离/历史素材：可手动训练，但不进入自动选材与周测新题池。')
-        refresh().then(() => openMaterial(payload.material_id)).catch(() => {})
+        // A manual import carries no source evidence: it is stored isolated and
+        // must not start a new training session. The material stays visible in
+        // the material list and its records are preserved.
+        setMessage(
+          payload.ingestion_status === 'QUARANTINED'
+            ? '素材已导入为隔离素材：不进入新训练、自动选材与周测新题池，记录保留可查看。'
+            : '素材已导入。',
+        )
+        refresh().catch(() => {})
       })
       .catch((error) => setMessage(error.message))
   }
 
+  const isolationBlocked = Boolean(selected)
+    && selected.ingestion_status !== 'INGESTED'
+    && (!selected.current_state || selected.current_state === 'READY_FIRST_LISTEN')
+
   const trainingBody = () => {
     if (!selected) return null
+    if (isolationBlocked) {
+      return <div className="event-panel">
+        <p className="muted">{QUARANTINED_LABEL}</p>
+        <p>该素材没有可核验的来源证据，只能查看记录，不能开始新的训练。已经开始的训练与历史记录不受影响。</p>
+        <button className="secondary" onClick={() => setView('materials')}>返回素材列表</button>
+      </div>
+    }
     const state = selected.current_state
     if (state === 'READY_FIRST_LISTEN') {
       return <div className="event-panel">
@@ -503,9 +533,9 @@ function App() {
         {view === 'materials' && <section className="module">
           <div className="section-heading light"><div><p className="eyebrow">声音训练素材</p><h2>搜索并进入训练</h2></div><button className="secondary" onClick={() => setShowImport(!showImport)}>{showImport ? '关闭导入' : '导入素材'}</button></div>
           <form className="search-bar" onSubmit={search}><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索标题、编号或 transcript" /><button className="primary" type="submit">搜索</button></form><p className="search-hint">当前搜索范围：本地已导入素材；外部素材源将在 MaterialProvider 接入后开放。</p>
-          {showImport && <form className="import-form" onSubmit={createMaterial}><input required placeholder="素材 ID，如 lesson-001" value={form.material_id} onChange={(event) => setForm({ ...form, material_id: event.target.value })} /><input required placeholder="素材标题" value={form.title} onChange={(event) => setForm({ ...form, title: event.target.value })} /><input required placeholder="音频路径（本地文件）" value={form.audio_path} onChange={(event) => setForm({ ...form, audio_path: event.target.value })} /><textarea required placeholder="每行一句，至少 3 行" value={form.transcript} onChange={(event) => setForm({ ...form, transcript: event.target.value })} /><button className="primary" type="submit">保存并进入训练</button></form>}
+          {showImport && <form className="import-form" onSubmit={createMaterial}><input required placeholder="素材 ID，如 lesson-001" value={form.material_id} onChange={(event) => setForm({ ...form, material_id: event.target.value })} /><input required placeholder="素材标题" value={form.title} onChange={(event) => setForm({ ...form, title: event.target.value })} /><input required placeholder="音频路径（本地文件）" value={form.audio_path} onChange={(event) => setForm({ ...form, audio_path: event.target.value })} /><textarea required placeholder="每行一句，至少 3 行" value={form.transcript} onChange={(event) => setForm({ ...form, transcript: event.target.value })} /><button className="primary" type="submit">保存为隔离素材</button></form>}
           {message && <p className="notice">{message}</p>}
-          <div className="result-list">{materials.length ? materials.map((material) => <button className="result-row" key={material.material_id} onClick={() => openMaterial(material.material_id)}><div><strong>{material.title}</strong><p>{material.material_id} · {Math.round(material.duration_seconds)} 秒</p></div><span>{material.current_state || material.status} →</span></button>) : <p className="empty light-text">没有匹配素材。可以先导入一个预置素材。</p>}</div>
+          <div className="result-list">{materials.length ? materials.map((material) => <button className="result-row" key={material.material_id} onClick={() => openMaterial(material.material_id)}><div><strong>{material.title}</strong><p>{material.material_id} · {Math.round(material.duration_seconds)} 秒{material.ingestion_status && material.ingestion_status !== 'INGESTED' ? ' · 隔离（仅查看）' : ''}</p></div><span>{material.current_state || material.status} →</span></button>) : <p className="empty light-text">没有匹配素材。可以先导入一个预置素材。</p>}</div>
         </section>}
 
         {view === 'weekly' && <section className="module">
@@ -532,7 +562,7 @@ function App() {
         </section>}
 
         {view === 'training' && <section className="module training-module">
-          {selected && <><div className="section-heading light"><div><p className="eyebrow">声音训练</p><h2>{selected.title}</h2><p className="muted">{selected.material_id} · {selected.sentences.length} 句 · {selected.source_name || '预置素材'}</p></div><div className="training-actions"><span className="state-badge">{selected.current_state}</span><button className="skip-btn" onClick={skipMaterial}>跳过此素材，换一篇</button></div></div>
+          {selected && <><div className="section-heading light"><div><p className="eyebrow">声音训练</p><h2>{selected.title}</h2><p className="muted">{selected.material_id} · {selected.sentences.length} 句 · {selected.source_name || '预置素材'}{selected.ingestion_status && selected.ingestion_status !== 'INGESTED' ? ` · ${selected.ingestion_status}` : ''}</p></div><div className="training-actions">{selected.ingestion_status && selected.ingestion_status !== 'INGESTED' ? <span className="state-badge">{QUARANTINED_LABEL}</span> : null}<span className="state-badge">{selected.current_state}</span><button className="skip-btn" onClick={skipMaterial}>跳过此素材，换一篇</button></div></div>
           <div className="progress-matrix-wrap"><p className="eyebrow">流程状态</p>{progressMatrix()}</div>
           <div className="audio-panel"><p className="eyebrow">素材音频</p><audio controls preload="metadata" src={`/api/materials/${encodeURIComponent(selected.material_id)}/audio`} onEnded={() => setFirstListenPlayed(true)} /><p className="muted">如果播放器提示找不到文件，请检查导入时填写的本地音频路径。</p></div>
           <div className="training-panel"><h3>继续训练</h3>{trainingBody()}</div>{message && <p className="notice">{message}</p>}</>}

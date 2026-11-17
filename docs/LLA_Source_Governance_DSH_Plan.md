@@ -119,3 +119,21 @@ DSH 交付完整 SHA、变更清单、逐条测试结果、运行证据与剩余
 8. 新增 `docs/LLA_Source_Governance_Verification.md`；本文档追加本节实施证据。
 
 未决（保持 Out of Scope / Backlog）：真实平台适配器与授权、逐课 CEFR/口音/稿音人工核验、联网小规模验证、主库正式迁移执行。
+
+## 实施证据（DSH 第二轮，2026-11-17，响应 Codex 首轮审查 FAIL）
+
+父提交 `b54ecc2`（clean），修复与本文档同一提交。按审查证据逐项做最小修复，所有改动仍在原计划文件内，另仅改 `backend/tests/fixtures.py`、`backend/tests/acceptance/test_p0_acceptance.py` 用于可信离线输入（保留周测状态机与幂等断言）。逐项映射、回归负例、本地静态/内存核验与真实未解决项见 `docs/LLA_Source_Governance_Verification.md` §D。
+
+要点：
+
+1. `material_candidates` 成为唯一事实来源：删除 `source_governance.ledger.*` 逐条 ledger，逐条落库（未下载字段允许 NULL，旧库以一次additive重建迁移放开 NOT NULL）；`app_metadata` 只存全局活动周期、目录快照、报告与确认。
+2. 发现与处理分离：先持久化完整目录清单，再按 CEFR → course_order → item_order 处理；不再按音质/语速/时长重排（`_rank` 删除）。
+3. 单一主源全局锁（`source_governance.active`），`scope_id` 只划分候选行。
+4. 严格英音：仅 `en-GB` 可入库，en-US 直接排除，其余口音待审；授权未清只记录不下载。
+5. 报告实时校验：`confirm_switch` 在同一写事务重算报告并与 `state_fingerprint` 比对，目录总数/游标/待处理项共同决定能否切换。
+6. 学习等级与发现等级分离：`confirmed_learning_level` 只依据现有八周确认记录（未改 `difficulty_progression`），写入源元数据，初始 A1。
+7. `prepare` 收敛为单写事务复验；`material_id = platform:item_id`。
+8. 周测新题池要求当前活动源 + `en-GB` + 已授权 + 已验证；`/api/materials/available` 由后端决定可训练清单，隔离素材不再自动进入新训练。
+9. 官方稿与独立 ASR 显著矛盾记 `TRANSCRIPT_CONTRADICTED` 并隔离；无噪声底证据不得评为 Clear。
+
+未决：详见 §D.4，其中包含本轮自身造成的 `data/*.sqlite3` 清理风险（无法证明主库文件在本轮开始前存在与否，已删除文件无备份可恢复），需 Codex 核对；本轮不宣称 Close。

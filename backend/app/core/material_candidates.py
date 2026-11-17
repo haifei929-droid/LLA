@@ -1,24 +1,32 @@
 """Source-governed material discovery, review and ingestion.
 
-`material_candidates` is the persistent discovery list: every inspected
-catalog entry keeps the identity, ordering, accent, license, transcript and
-review evidence that decided its disposition (pending / pending review /
-rejected / retryable failure / confirmed unavailable / ingested).
-`app_metadata` holds the single active source cycle per scope, its catalog
-scope/cursor, the completion report and the user's explicit confirmation — no
-new database and no new source adapter is introduced here.
+`material_candidates` is the single persistent discovery list *and* the single
+source of truth for every entry's state: a discovered entry, a rejected one, a
+retryable failure, a reviewed item and an ingested material all live in that
+one table together with the identity, ordering, accent, license, transcript and
+review evidence that decided them. `app_metadata` only holds the one active
+source cycle (with its catalog snapshot), the completion report and the user's
+explicit confirmation -- there is no second per-entry ledger that could drift
+out of sync, and an interrupted run resumes from the persisted rows.
 
 Enforced rules (LLA source governance plan):
 
-- no platform is active until the user confirms it together with
-  authorization evidence, and a failure never falls back to another platform;
-- en-US material is excluded outright; unknown/mixed accent, unverified
-  license, unverified CEFR level and unverified transcript stay in review and
-  never enter the formal training library;
-- the only ingestible item is the next qualified item in platform order
-  (CEFR A1 -> A2 -> B1, then course, then lesson order);
-- discovery, review, download and ingestion states are persisted, so an
-  interrupted run resumes from the persisted list instead of losing evidence;
+- exactly one active source in the whole installation; the `scope_id` argument
+  partitions candidate rows, it can never activate a second source;
+- no platform is active until the user confirms it together with authorization
+  evidence, and a failure never falls back to another platform;
+- the accent must be the canonical ``en-GB``: en-US is excluded outright and any
+  other accent (en-AU, mixed, unknown, arbitrary text) stays in review;
+- unverified license, unverified CEFR level and unverified transcript never
+  enter the formal training library, and an item whose authorization is not
+  cleared is recorded *without* being downloaded;
+- the catalog is discovered first (the whole list is persisted), and only then
+  are entries processed in platform course order (CEFR A1 -> A2 -> B1, then
+  course, then lesson order). Provider input order, audio quality and speech
+  rate never re-rank it;
+- discovery level is not learning eligibility: learning is capped by the CEFR
+  level the existing eight-week confirmation mechanism has actually confirmed,
+  never by a client-supplied stage nor by "A1 is exhausted";
 - the whole original lesson audio is kept; the existing three-Part training
   structure and quality bar are untouched (there is no 15-20 minute gate).
 """
@@ -41,9 +49,11 @@ from app.adapters.web_material import align_sentences, split_sentences
 from app.config import Settings
 from app.core.audio_quality import ANALYZER_VERSION, THRESHOLD_CONFIG_VERSION, AudioQualityAnalyzer
 from app.core.transcript_validator import (
+    CONTRADICTED,
     OFFICIAL_ORIGIN,
     TRANSCRIPT_VERIFIED,
     encode_timestamped,
+    transcript_agreement,
     transcript_verification,
     validate_transcript,
 )
@@ -66,11 +76,23 @@ SOURCE_LABELS: dict[str, str] = {
 }
 #: CEFR learning order; an unlabelled item is pending review, never guessed.
 CEFR_ORDER: dict[str, int] = {"A1": 1, "A2": 2, "B1": 3}
+#: Accent canonicalisation: only British English may enter the library.
+BRITISH_ACCENT = "en-GB"
+US_ACCENT = "en-US"
+UK_ACCENT_TOKENS = frozenset(
+    {"en-gb", "en-gb-x", "en-uk", "gb", "uk", "british", "gb-en", "en-gb-scotland"}
+)
 #: Accents that are excluded outright (no US-English material).
-EXCLUDED_ACCENTS = frozenset({"en-us", "en_us", "american", "us"})
+EXCLUDED_ACCENTS = frozenset({"en-us", "en-us-x", "us", "american", "us-en"})
 #: Accent tokens that mean "no usable evidence yet".
-UNKNOWN_ACCENTS = frozenset({"", "unknown", "mixed", "n/a", "und", "na"})
+UNKNOWN_ACCENTS = frozenset({"", "unknown", "mixed", "n/a", "und", "na", "none", "null"})
 LICENSE_CLEARED = "CLEARED"
+
+#: Difficulty stages of the existing eight-week mechanism and the CEFR ceiling
+#: each confirmed stage unlocks. The mapping is read-only here: the eight-week
+#: module owns the confirmation, this service only verifies the record.
+STAGES: tuple[str, ...] = ("STAGE_1", "STAGE_2", "STAGE_3")
+LEARNING_LEVEL_BY_STAGE: dict[str, str] = {"STAGE_1": "A1", "STAGE_2": "A2", "STAGE_3": "B1"}
 
 #: Candidate dispositions (persisted in material_candidates.ingestion_status).
 PENDING = "PENDING"
@@ -84,18 +106,12 @@ OUT_OF_SCOPE = "OUT_OF_SCOPE"
 #: Dispositions that block a source switch (still processable work).
 BLOCKING_DISPOSITIONS = (PENDING, ELIGIBLE, RETRYABLE_FAILED)
 
-#: VOA program zones per difficulty stage, kept for legacy VOA-shaped
-#: providers that still expose `_list_episodes` (no default source uses it).
+#: Legacy VOA program zones, kept for providers that still expose
+#: `_list_episodes` (no default source uses it; it never orders ingestion).
 STAGE_ZONES: dict[str, list[int]] = {
     "STAGE_1": [4456, 4791, 5254, 5535, 1581],
     "STAGE_2": [986, 1689, 955, 959, 979, 987],
     "STAGE_3": [986, 1689, 955, 959, 979, 987],
-}
-#: Speech-rate targets per stage, used for candidate ranking (P1 3.1).
-STAGE_WPM_TARGETS: dict[str, float] = {
-    "STAGE_1": 120.0,
-    "STAGE_2": 150.0,
-    "STAGE_3": 170.0,
 }
 #: Max raw entries scanned per discovery run.
 PROCESS_LIMIT = 250
@@ -107,12 +123,12 @@ CANDIDATE_TTL_DAYS = 7
 MIN_COVERAGE = 0.80
 MIN_SENTENCES = 10
 
-_ACTIVE_KEY = "source_governance.source.{scope}"
-_REPORT_KEY = "source_governance.report.{scope}.{cycle}"
-_REPORTS_KEY = "source_governance.reports.{scope}"
-_CONFIRM_KEY = "source_governance.confirmation.{scope}"
-_LEDGER_KEY = "source_governance.ledger.{scope}.{platform}.{cycle}"
-_HISTORY_KEY = "source_governance.history.{scope}"
+#: One active source for the whole installation: the key is deliberately not
+#: scoped, so no scope argument can open a second active source.
+_ACTIVE_KEY = "source_governance.active"
+_REPORT_KEY = "source_governance.report.{cycle}"
+_CONFIRM_KEY = "source_governance.confirmation"
+_HISTORY_KEY = "source_governance.history"
 
 
 class SourceGovernanceError(ValueError):
@@ -125,18 +141,32 @@ class SourceGovernanceError(ValueError):
 
 
 def normalize_accent(value: object) -> str | None:
-    """Return a comparable accent token, or None when there is no evidence."""
+    """Canonical accent token: ``en-GB`` / ``en-US`` / the raw token / None.
+
+    Only a British-English token maps to ``en-GB``. A US token maps to
+    ``en-US`` (excluded), and any other distinct token is returned as-is so the
+    caller can keep it in review instead of silently accepting it.
+    """
     if value is None:
         return None
     token = re.sub(r"\s+", "", str(value)).lower().replace("_", "-")
     if token in UNKNOWN_ACCENTS:
         return None
+    if token in UK_ACCENT_TOKENS:
+        return BRITISH_ACCENT
+    if token in EXCLUDED_ACCENTS:
+        return US_ACCENT
     return token
 
 
 def is_excluded_accent(value: object) -> bool:
-    token = normalize_accent(value)
-    return token is not None and token in EXCLUDED_ACCENTS
+    """True for a US-English declaration (excluded at every entry point)."""
+    return normalize_accent(value) == US_ACCENT
+
+
+def is_british_accent(value: object) -> bool:
+    """True only for the canonical British-English accent."""
+    return normalize_accent(value) == BRITISH_ACCENT
 
 
 def normalize_license(value: object) -> str:
@@ -153,21 +183,34 @@ def next_platform(platform: str | None) -> str | None:
     return SOURCE_ORDER[index] if index < len(SOURCE_ORDER) else None
 
 
+def is_level_allowed(cefr_level: object, ceiling: object) -> bool:
+    """True when the item's CEFR level is within the confirmed learning level."""
+    required = CEFR_ORDER.get(str(cefr_level or "").upper())
+    allowed = CEFR_ORDER.get(str(ceiling or "").upper())
+    if required is None or allowed is None:
+        return False
+    return required <= allowed
+
+
 def assess_disposition(item: dict[str, object]) -> tuple[str, str | None]:
     """Metadata-level disposition of a catalog item.
 
     Returns (disposition, reason_code). `ELIGIBLE` only means the discovery
     metadata is complete; audio quality and transcript verification are still
-    required before ingestion.
+    required before ingestion. Only the canonical en-GB accent qualifies: any
+    other accent name (en-AU, mixed, unknown, arbitrary text) is review work,
+    never an accepted item.
     """
     accent = normalize_accent(item.get("accent"))
-    if accent is not None and accent in EXCLUDED_ACCENTS:
+    if accent == US_ACCENT:
         return REJECTED, "ACCENT_EXCLUDED_EN_US"
     if normalize_license(item.get("license_status")) != LICENSE_CLEARED:
         return PENDING_REVIEW, "LICENSE_UNVERIFIED"
     if accent is None:
         return PENDING_REVIEW, "ACCENT_UNVERIFIED"
-    if item.get("cefr_level") not in CEFR_ORDER:
+    if accent != BRITISH_ACCENT:
+        return PENDING_REVIEW, "ACCENT_NOT_UK"
+    if str(item.get("cefr_level") or "").upper() not in CEFR_ORDER:
         return PENDING_REVIEW, "CEFR_UNVERIFIED"
     if not item.get("transcript_verified"):
         return PENDING_REVIEW, "TRANSCRIPT_UNVERIFIED"
@@ -207,7 +250,7 @@ def normalize_item(entry: object) -> dict[str, object]:
         "source_course": data.get("source_course"),
         "course_order": data.get("course_order"),
         "item_order": data.get("item_order"),
-        "cefr_level": data.get("cefr_level"),
+        "cefr_level": str(data.get("cefr_level") or "").upper() or None,
         "accent": accent,
         "speaker_id": data.get("speaker_id"),
         "transcript": data.get("transcript"),
@@ -227,14 +270,37 @@ def _item_id_from_url(url: str) -> str:
 
 
 def _course_key(row) -> tuple:
-    """Platform course order: CEFR A1 -> A2 -> B1, then course, then lesson."""
+    """Platform course order: CEFR A1 -> A2 -> B1, then course, then lesson.
+
+    The course *order* number decides before the course *name*: sorting by name
+    first would reorder the platform's own sequence.
+    """
     return (
-        CEFR_ORDER.get(row["cefr_level"], 9),
-        row["source_course"] or "",
+        CEFR_ORDER.get(str(row["cefr_level"] or "").upper(), 9),
         row["course_order"] if row["course_order"] is not None else 2**31 - 1,
         row["item_order"] if row["item_order"] is not None else 2**31 - 1,
+        row["source_course"] or "",
         row["provider_item_id"],
     )
+
+
+def _candidate_id(platform: str, item_id: str) -> str:
+    """Stable candidate identity: platform + item id, never the URL or batch."""
+    digest = hashlib.sha256(f"{platform}|{item_id}".encode()).hexdigest()[:24]
+    return f"cand-{digest}"
+
+
+def _content_fingerprint(platform: str, item_id: str) -> str:
+    return hashlib.sha256(f"{platform}|{item_id}".encode()).hexdigest()[:32]
+
+
+def material_id_for(platform: str, item_id: str) -> str:
+    """Formal material id: the platform is part of the identity.
+
+    Two platforms routinely use the same lesson number, so the bare provider
+    item id is not a unique material identity.
+    """
+    return f"{str(platform).upper()}:{item_id}"
 
 
 def _parse_timestamp(value: object) -> datetime | None:
@@ -249,11 +315,43 @@ def _parse_timestamp(value: object) -> datetime | None:
     return parsed
 
 
+def confirmed_learning_level(connection, scope_id: str) -> str:
+    """CEFR learning ceiling confirmed by the existing eight-week mechanism.
+
+    The ceiling starts at A1. It only rises when `training_difficulty_profiles`
+    records a higher stage *and* the matching number of `UPGRADE_CONFIRMED`
+    prompt decisions exists, so neither a stray profile row nor a client
+    argument can unlock a level: the eight-week confirmation record is the
+    evidence. `difficulty_progression` is not modified by this read.
+    """
+    stage = STAGES[0]
+    try:
+        row = connection.execute(
+            "SELECT current_stage FROM training_difficulty_profiles WHERE scope_id = ?",
+            (scope_id,),
+        ).fetchone()
+        if row is not None and row["current_stage"] in STAGES:
+            stage = row["current_stage"]
+        confirmed = connection.execute(
+            """
+            SELECT COUNT(*) AS n FROM upgrade_prompts
+             WHERE scope_id = ? AND prompt_status = 'RESOLVED' AND decision = 'UPGRADE_CONFIRMED'
+            """,
+            (scope_id,),
+        ).fetchone()["n"]
+    except sqlite3.Error:  # a database without the difficulty tables yet
+        return LEARNING_LEVEL_BY_STAGE[STAGES[0]]
+    steps = min(STAGES.index(stage), int(confirmed or 0))
+    return LEARNING_LEVEL_BY_STAGE[STAGES[steps]]
+
+
 def active_source_platform(database: Database, scope_id: str = "default") -> str | None:
-    """The active platform for a scope, if any (read-only helper)."""
+    """The active platform for the installation, if any (read-only helper)."""
     with database.connect() as connection:
-        state = _read_metadata(connection, _ACTIVE_KEY.format(scope=scope_id))
-    return None if state is None else str(state.get("platform"))
+        state = _read_metadata(connection, _ACTIVE_KEY)
+    if not isinstance(state, dict):
+        return None
+    return None if state.get("platform") is None else str(state.get("platform"))
 
 
 def _read_metadata(connection, key: str) -> object | None:
@@ -310,28 +408,35 @@ class MaterialCandidateService:
     # Active source cycle: activation, report, confirmed switch
     # ------------------------------------------------------------------
 
-    def active_source(self, scope_id: str, connection=None) -> dict[str, object] | None:
+    def active_source(self, scope_id: str = "default", connection=None) -> dict[str, object] | None:
         with self._connection(connection) as conn:
-            state = _read_metadata(conn, _ACTIVE_KEY.format(scope=scope_id))
+            state = _read_metadata(conn, _ACTIVE_KEY)
         return state if isinstance(state, dict) else None
+
+    def learning_level(self, scope_id: str = "default") -> str:
+        """Recompute and record the confirmed CEFR ceiling of the active source.
+
+        The ceiling is derived from the eight-week confirmation records and is
+        persisted in the source metadata (initial A1) so the UI and the report
+        show the same value the ingestion path enforces.
+        """
+        with self.database.connect() as connection:
+            level = confirmed_learning_level(connection, scope_id)
+            active = _read_metadata(connection, _ACTIVE_KEY)
+            if isinstance(active, dict) and active.get("learning_level") != level:
+                active["learning_level"] = level
+                active["learning_level_updated_at"] = self.now_fn().isoformat()
+                _write_metadata(connection, _ACTIVE_KEY, active)
+        return level
 
     def source_state(self, scope_id: str) -> dict[str, object]:
         active = self.active_source(scope_id)
         with self._connection() as connection:
-            confirmation = _read_metadata(connection, _CONFIRM_KEY.format(scope=scope_id))
+            confirmation = _read_metadata(connection, _CONFIRM_KEY)
             report = None
-            ledger = None
             if active is not None:
                 cycle = int(active.get("cycle", 1))
-                report = _read_metadata(
-                    connection, _REPORT_KEY.format(scope=scope_id, cycle=cycle)
-                )
-                ledger = _read_metadata(
-                    connection,
-                    _LEDGER_KEY.format(
-                        scope=scope_id, platform=active.get("platform"), cycle=cycle
-                    ),
-                )
+                report = _read_metadata(connection, _REPORT_KEY.format(cycle=cycle))
         return {
             "scope_id": scope_id,
             "active_source": active,
@@ -340,9 +445,10 @@ class MaterialCandidateService:
                 {"platform": platform, "label": SOURCE_LABELS.get(platform, platform)}
                 for platform in SOURCE_ORDER
             ],
+            "learning_level": None if active is None else active.get("learning_level"),
             "last_report": None if report is None else _report_summary(report),
             "confirmation": confirmation,
-            "discovery": None if ledger is None else _ledger_summary(ledger),
+            "discovery": None if active is None else _catalog_summary(active),
         }
 
     def activate_source(
@@ -356,11 +462,12 @@ class MaterialCandidateService:
         confirmed_by: str = "USER",
         note: str | None = None,
     ) -> dict[str, object]:
-        """Activate the first source cycle for a scope.
+        """Activate the first source cycle.
 
         Requires an explicitly evaluated platform plus authorization and
-        catalog-scope evidence. A second platform can only be activated
-        through the confirmed switch flow on top of a current report.
+        catalog-scope evidence. The active source is installation-wide: a
+        second platform can only be activated through the confirmed switch
+        flow on top of a current report, and no scope argument can bypass it.
         """
         platform = str(platform).strip().upper()
         if platform not in SOURCE_ORDER:
@@ -389,15 +496,20 @@ class MaterialCandidateService:
             state = {
                 "platform": platform,
                 "cycle": 1,
+                "scope_id": scope_id,
                 "license_reference": str(license_reference),
                 "catalog_scope": str(catalog_scope),
                 "activated_at": now.isoformat(),
                 "confirmed_by": confirmed_by,
                 "note": note,
                 "previous_platform": None,
+                # The learning ceiling starts at A1; it only rises through the
+                # eight-week confirmation records (see learning_level()).
+                "learning_level": confirmed_learning_level(connection, scope_id),
+                "catalog": None,
             }
-            _write_metadata(connection, _ACTIVE_KEY.format(scope=scope_id), state)
-            history = _read_metadata(connection, _HISTORY_KEY.format(scope=scope_id)) or []
+            _write_metadata(connection, _ACTIVE_KEY, state)
+            history = _read_metadata(connection, _HISTORY_KEY) or []
             history.append(
                 {
                     "event": "SOURCE_ACTIVATED",
@@ -409,43 +521,27 @@ class MaterialCandidateService:
                     "confirmed_by": confirmed_by,
                 }
             )
-            _write_metadata(connection, _HISTORY_KEY.format(scope=scope_id), history[-20:])
+            _write_metadata(connection, _HISTORY_KEY, history[-20:])
         return state
 
     def report(self, scope_id: str) -> dict[str, object]:
         """Generate and persist the completion report for the current cycle.
 
-        Coverage, classification, legal acquisition, ingestion and the
-        remaining items are reported separately: discovering the whole catalog
-        never means legally acquiring or ingesting all of it.
+        The report is recomputed from the persisted candidate rows and the
+        recorded catalog snapshot at call time, so it always reflects the
+        current list. Coverage, classification, legal acquisition, ingestion
+        and the remaining items are reported separately: discovering the whole
+        catalog never means legally acquiring or ingesting all of it.
         """
-        active = self.active_source(scope_id)
-        if active is None:
-            raise SourceGovernanceError("SOURCE_NOT_APPROVED", "no active source to report on")
-        platform = str(active["platform"])
-        cycle = int(active.get("cycle", 1))
-        now = self.now_fn()
         with self.database.connect() as connection:
-            ledger = _read_metadata(
-                connection, _LEDGER_KEY.format(scope=scope_id, platform=platform, cycle=cycle)
-            ) or _empty_ledger(scope_id, platform, cycle)
-            rows = connection.execute(
-                """
-                SELECT ingestion_status, COUNT(*) AS n
-                  FROM material_candidates
-                 WHERE scope_id = ? AND provider = ?
-                 GROUP BY ingestion_status
-                """,
-                (scope_id, platform),
-            ).fetchall()
-            report = _build_report(ledger, scope_id, platform, cycle, now.isoformat())
-            _write_metadata(
-                connection, _REPORT_KEY.format(scope=scope_id, cycle=cycle), report
-            )
-            report_ids = _read_metadata(connection, _REPORTS_KEY.format(scope=scope_id)) or []
-            report_ids = [report["report_id"], *[rid for rid in report_ids if rid != report["report_id"]]][:10]
-            _write_metadata(connection, _REPORTS_KEY.format(scope=scope_id), report_ids)
-            report["ingestion_rows"] = {row["ingestion_status"]: row["n"] for row in rows}
+            return self._write_report(connection, scope_id)
+
+    def _write_report(self, connection, scope_id: str) -> dict[str, object]:
+        active = _read_metadata(connection, _ACTIVE_KEY)
+        if not isinstance(active, dict):
+            raise SourceGovernanceError("SOURCE_NOT_APPROVED", "no active source to report on")
+        report = _build_report(connection, scope_id, active, self.now_fn().isoformat())
+        _write_metadata(connection, _REPORT_KEY.format(cycle=int(active.get("cycle", 1))), report)
         return report
 
     def confirm_switch(
@@ -461,8 +557,10 @@ class MaterialCandidateService:
     ) -> dict[str, object]:
         """Switch to the next platform only on an explicit, current confirmation.
 
-        The confirmation is bound to one report version: a regenerated report
-        (new discovery, changed disposition) invalidates the old confirmation.
+        The confirmation is bound to one report version *and* the report is
+        recomputed inside this write transaction: any discovery, review,
+        ingestion or catalog change since the report was generated invalidates
+        the old confirmation, and an old report_id can never be replayed.
         """
         platform = str(next_source).strip().upper()
         if platform not in SOURCE_ORDER:
@@ -487,32 +585,55 @@ class MaterialCandidateService:
                     "SOURCE_ORDER_VIOLATION",
                     f"the next platform in the fixed order is {expected}, not {platform}",
                 )
-            report = _read_metadata(
-                connection, _REPORT_KEY.format(scope=scope_id, cycle=cycle)
-            )
-            if not isinstance(report, dict) or report.get("report_id") != report_id:
+            stored = _read_metadata(connection, _REPORT_KEY.format(cycle=cycle))
+            if not isinstance(stored, dict) or stored.get("report_id") != report_id:
                 raise SourceGovernanceError(
                     "CONFIRMATION_STALE",
                     "the confirmed report is missing or has been regenerated",
                 )
-            if report.get("catalog_complete") is not True or report.get("has_cursor"):
+            # Recompute from the live rows: a report that no longer describes
+            # the current discovery/review/ingestion state is stale.
+            live = _build_report(connection, scope_id, active, now.isoformat())
+            if live["state_fingerprint"] != stored.get("state_fingerprint"):
+                raise SourceGovernanceError(
+                    "CONFIRMATION_STALE",
+                    "the discovery/review/ingestion state changed after the report",
+                )
+            if not live["catalog_complete"] or live["has_cursor"]:
                 raise SourceGovernanceError(
                     "SOURCE_CATALOG_INCOMPLETE",
                     "the catalog snapshot is incomplete; completion cannot be reported",
                 )
-            if report.get("retryable_failures") or report.get("qualified_unprocessed"):
+            if live["known_total"] is None:
+                raise SourceGovernanceError(
+                    "SOURCE_CATALOG_INCOMPLETE",
+                    "the catalog total is unknown; completion cannot be reported",
+                )
+            if live["discovered"] != live["known_total"]:
+                raise SourceGovernanceError(
+                    "SOURCE_CATALOG_INCOMPLETE",
+                    f"only {live['discovered']} of {live['known_total']} catalog entries are discovered",
+                )
+            if (
+                live["retryable_failures"]
+                or live["qualified_unprocessed"]
+                or live["pending_processing"]
+            ):
                 raise SourceGovernanceError(
                     "SOURCE_ITEMS_PENDING",
                     "retryable failures or unprocessed qualified items remain",
                 )
-            if report.get("pending_manual_items") and not acknowledge_pending:
+            decision_items = list(live["pending_manual_items"]) + list(live["deferred_items"])
+            if decision_items and not acknowledge_pending:
                 raise SourceGovernanceError(
                     "PENDING_ITEMS_REQUIRE_DECISION",
-                    "items awaiting manual confirmation must be explicitly acknowledged",
+                    "items awaiting manual confirmation or a confirmed learning level "
+                    "must be explicitly acknowledged",
                 )
             state = {
                 "platform": platform,
                 "cycle": cycle + 1,
+                "scope_id": scope_id,
                 "license_reference": str(license_reference),
                 "catalog_scope": str(catalog_scope),
                 "activated_at": now.isoformat(),
@@ -521,11 +642,13 @@ class MaterialCandidateService:
                 "previous_platform": current_platform,
                 "previous_cycle": cycle,
                 "confirmed_report_id": report_id,
+                "learning_level": confirmed_learning_level(connection, scope_id),
+                "catalog": None,
             }
-            _write_metadata(connection, _ACTIVE_KEY.format(scope=scope_id), state)
+            _write_metadata(connection, _ACTIVE_KEY, state)
             _write_metadata(
                 connection,
-                _CONFIRM_KEY.format(scope=scope_id),
+                _CONFIRM_KEY,
                 {
                     "report_id": report_id,
                     "from_platform": current_platform,
@@ -533,10 +656,10 @@ class MaterialCandidateService:
                     "cycle": cycle + 1,
                     "confirmed_at": now.isoformat(),
                     "confirmed_by": confirmed_by,
-                    "acknowledged_pending_items": report.get("pending_manual_items", []),
+                    "acknowledged_pending_items": report_pending(live),
                 },
             )
-            history = _read_metadata(connection, _HISTORY_KEY.format(scope=scope_id)) or []
+            history = _read_metadata(connection, _HISTORY_KEY) or []
             history.append(
                 {
                     "event": "SOURCE_SWITCH_CONFIRMED",
@@ -548,7 +671,7 @@ class MaterialCandidateService:
                     "confirmed_by": confirmed_by,
                 }
             )
-            _write_metadata(connection, _HISTORY_KEY.format(scope=scope_id), history[-20:])
+            _write_metadata(connection, _HISTORY_KEY, history[-20:])
         return state
 
     # ------------------------------------------------------------------
@@ -566,11 +689,15 @@ class MaterialCandidateService:
     ) -> dict[str, object]:
         """Run one governed discovery pass over the active platform.
 
-        There is no 15-20 minute gate: an explicit band is honoured when the
-        caller passes one, otherwise every original lesson length is allowed
-        and the existing audio-quality bar still applies.
+        The complete catalog list is persisted first, and only then are entries
+        processed (download, quality, transcription) in platform course order:
+        the provider's input order, the audio grade and the client-supplied
+        stage never decide what comes next. There is no 15-20 minute gate: an
+        explicit band is honoured when the caller passes one, otherwise every
+        original lesson length is allowed and the existing audio-quality bar
+        still applies.
         """
-        if speed_stage not in STAGE_WPM_TARGETS:
+        if speed_stage not in STAGES:
             raise ValueError(f"unsupported speed_stage: {speed_stage}")
         if not 1 <= max_results <= 3:
             raise ValueError("max_results must be between 1 and 3")
@@ -601,189 +728,130 @@ class MaterialCandidateService:
         batch_id = str(uuid4())
         now = self.now_fn()
         rejected: dict[str, int] = {}
-        candidates: list[dict[str, object]] = []
-        pending: list[dict[str, object]] = []
-        quarantined: list[dict[str, object]] = []
+        declared_catalog = self._catalog_info(provider)
+        ceiling = self.learning_level(scope_id)
         work_dir = self.settings.processed_dir / "p1-candidates" / batch_id
-        ledger = self._load_ledger(scope_id, platform, cycle, provider)
+        work_dir.mkdir(parents=True, exist_ok=True)
 
-        for entry in self._provider_items(provider, speed_stage)[:PROCESS_LIMIT]:
-            item = normalize_item(entry)
-            item_id = str(item["source_item_id"])
-            disposition, reason = assess_disposition(item)
-            duration = item.get("duration_seconds")
-            if disposition in (ELIGIBLE, PENDING_REVIEW):
-                if duration is None:
-                    rejected["duration_missing"] = rejected.get("duration_missing", 0) + 1
-                    disposition, reason = OUT_OF_SCOPE, "DURATION_MISSING"
-                elif not _duration_in_band(float(duration), lower, upper):
-                    rejected["duration_out_of_range"] = rejected.get("duration_out_of_range", 0) + 1
-                    disposition, reason = OUT_OF_SCOPE, "DURATION_OUT_OF_SCOPE"
-            if disposition == REJECTED:
-                key = "accent_excluded" if reason == "ACCENT_EXCLUDED_EN_US" else "quarantined"
-                rejected[key] = rejected.get(key, 0) + 1
-                self._record_item(ledger, item, REJECTED, reason, batch_id, now)
-                quarantined.append(_public_item(item, REJECTED, reason))
-                continue
-            if disposition == OUT_OF_SCOPE:
-                self._record_item(ledger, item, OUT_OF_SCOPE, reason, batch_id, now)
-                continue
+        items = [
+            normalize_item(entry)
+            for entry in self._provider_items(provider, speed_stage)[:PROCESS_LIMIT]
+        ]
 
-            prior = (ledger.get("items") or {}).get(item_id) or {}
-            if prior.get("disposition") == INGESTED:
-                rejected["duplicate"] = rejected.get("duplicate", 0) + 1
-                continue
-            fingerprint = hashlib.sha256(str(item["source_url"]).encode()).hexdigest()[:32]
-            existing = self._candidate_record(platform, item_id, scope_id, fingerprint)
-            if existing is not None:
-                # Already known (a re-run after a crash): keep its persisted
-                # disposition in the ledger instead of dropping the item.
-                rejected["duplicate"] = rejected.get("duplicate", 0) + 1
-                self._record_item(
-                    ledger,
-                    item,
-                    str(existing["ingestion_status"]),
-                    existing["failure_code"],
-                    batch_id,
-                    now,
-                    downloaded=bool(existing["audio_path"]),
+        # 1. Persist the whole discovered list (no download happens here).
+        with self.database.connect() as connection:
+            # A concurrent confirmed switch must not have its catalog snapshot
+            # overwritten by this (now stale) cycle.
+            current = _read_metadata(connection, _ACTIVE_KEY)
+            if (
+                not isinstance(current, dict)
+                or str(current.get("platform")) != platform
+                or int(current.get("cycle", 1)) != cycle
+            ):
+                raise SourceGovernanceError(
+                    "SOURCE_CYCLE_CONFLICT",
+                    "the active source changed while the catalog was being discovered",
                 )
-                continue
-
-            try:
-                audio_path = self._fetch_audio(provider, item, work_dir)
-            except Exception:
-                rejected["download_failed"] = rejected.get("download_failed", 0) + 1
-                self._record_item(ledger, item, RETRYABLE_FAILED, "DOWNLOAD_FAILED", batch_id, now)
-                continue
-
-            quality = self._analyze_audio(audio_path)
-            if quality is None:
-                rejected["quality_failed"] = rejected.get("quality_failed", 0) + 1
-                self._record_item(ledger, item, RETRYABLE_FAILED, "AUDIO_UNREADABLE", batch_id, now)
-                continue
-            if quality.level == "Poor":
-                rejected["quality_poor"] = rejected.get("quality_poor", 0) + 1
-                self._record_item(ledger, item, REJECTED, "QUALITY_POOR", batch_id, now)
-                continue
-            if not _duration_in_band(quality.duration_seconds, lower, upper):
-                rejected["duration_out_of_range"] = rejected.get("duration_out_of_range", 0) + 1
-                self._record_item(ledger, item, OUT_OF_SCOPE, "DURATION_OUT_OF_SCOPE", batch_id, now)
-                continue
-
-            try:
-                segments = self._retry(lambda: self.asr.transcribe(str(audio_path)))
-            except Exception:
-                rejected["transcribe_failed"] = rejected.get("transcribe_failed", 0) + 1
-                self._record_item(ledger, item, RETRYABLE_FAILED, "ASR_FAILED", batch_id, now)
-                continue
-
-            transcript, aligned = self._transcript_for(item, segments)
-            validation = validate_transcript(
-                transcript, aligned, quality.duration_seconds, MIN_COVERAGE, MIN_SENTENCES
-            )
-            if validation.status != "COMPLETE":
-                key = f"transcript_{validation.status.lower()}"
-                rejected[key] = rejected.get(key, 0) + 1
-                self._record_item(
-                    ledger, item, REJECTED, f"TRANSCRIPT_{validation.status}", batch_id, now
+            catalog = _catalog_snapshot(declared_catalog, current, items)
+            for item in items:
+                disposition, reason = assess_disposition(item)
+                duration = item.get("duration_seconds")
+                if disposition in (ELIGIBLE, PENDING_REVIEW):
+                    if duration is None:
+                        rejected["duration_missing"] = rejected.get("duration_missing", 0) + 1
+                        disposition, reason = OUT_OF_SCOPE, "DURATION_MISSING"
+                    elif not _duration_in_band(float(duration), lower, upper):
+                        rejected["duration_out_of_range"] = (
+                            rejected.get("duration_out_of_range", 0) + 1
+                        )
+                        disposition, reason = OUT_OF_SCOPE, "DURATION_OUT_OF_SCOPE"
+                if disposition == REJECTED:
+                    key = "accent_excluded" if reason == "ACCENT_EXCLUDED_EN_US" else "quarantined"
+                    rejected[key] = rejected.get(key, 0) + 1
+                if disposition == ELIGIBLE:
+                    # Discovery metadata is complete but the entry is not
+                    # processed yet (no audio, quality or transcript evidence):
+                    # it waits as PENDING, never as an ingestible candidate.
+                    disposition, reason = PENDING, None
+                inserted = self._persist_discovery(
+                    connection,
+                    scope_id=scope_id,
+                    platform=platform,
+                    item=item,
+                    disposition=disposition,
+                    reason=reason,
+                    batch_id=batch_id,
+                    speed_stage=speed_stage,
+                    now=now,
                 )
-                continue
+                if not inserted:
+                    rejected["duplicate"] = rejected.get("duplicate", 0) + 1
+            current["catalog"] = catalog
+            current["catalog_updated_at"] = now.isoformat()
+            current["learning_level"] = ceiling
+            _write_metadata(connection, _ACTIVE_KEY, current)
 
-            verification = transcript_verification(
-                validation,
-                item.get("transcript_origin"),
-                bool(item.get("transcript_verified")),
-            )
-            if disposition == ELIGIBLE and verification == TRANSCRIPT_VERIFIED:
-                final_disposition, final_reason = ELIGIBLE, None
-            else:
-                final_disposition = PENDING_REVIEW
-                final_reason = reason or "TRANSCRIPT_UNVERIFIED"
-
-            words = len(transcript.split())
-            wpm = (words / (quality.duration_seconds / 60.0)) if quality.duration_seconds else 0.0
-            candidate_id = str(uuid4())
-            stored = self._store_candidate(
-                candidate_id=candidate_id,
+        # 2. Process entries in course order, within the confirmed learning level.
+        processed = 0
+        for row in self._processable(scope_id, platform, ceiling, now):
+            if processed >= max_results:
+                break
+            outcome, key = self._process_row(
+                provider,
+                row,
                 scope_id=scope_id,
                 platform=platform,
-                item=item,
-                transcript=transcript,
-                aligned=aligned,
-                duration_seconds=quality.duration_seconds,
-                speed_stage=speed_stage,
-                quality=quality,
-                report_id=str(uuid4()),
-                transcript_status=validation.status,
                 batch_id=batch_id,
-                fingerprint=fingerprint,
-                audio_path=audio_path,
-                disposition=final_disposition,
-                reason=final_reason,
                 now=now,
+                speed_stage=speed_stage,
+                lower=lower,
+                upper=upper,
+                work_dir=work_dir,
             )
-            if not stored:
-                rejected["duplicate"] = rejected.get("duplicate", 0) + 1
-                continue
-            self._record_item(
-                ledger, item, final_disposition, final_reason, batch_id, now, downloaded=True
-            )
-            payload = {
-                "candidate_id": candidate_id,
-                "provider": platform,
-                "provider_item_id": item_id,
-                "title": item["title"],
-                "duration_seconds": round(quality.duration_seconds, 1),
-                "speed_stage": speed_stage,
-                "audio_quality": quality.level,
-                "transcript_status": validation.status,
-                "candidate_status": "CANDIDATE",
-                "speech_rate_wpm": round(wpm, 1),
-                "cefr_level": item.get("cefr_level"),
-                "accent": item.get("accent"),
-                "source_course": item.get("source_course"),
-                "item_order": item.get("item_order"),
-                "ingestion_status": final_disposition,
-                "reason_code": final_reason,
-            }
-            if final_disposition == ELIGIBLE:
-                candidates.append(payload)
-            else:
-                pending.append(payload)
-            if len(candidates) >= max_results:
-                break
+            if key:
+                rejected[key] = rejected.get(key, 0) + 1
+            if outcome == ELIGIBLE:
+                processed += 1
 
-        ranked = self._rank(
-            candidates,
-            target_duration_min if target_duration_min is not None else 0.0,
-            target_duration_max
-            if target_duration_max is not None
-            else max(
-                (float(candidate["duration_seconds"]) / 60.0 for candidate in candidates),
-                default=1.0,
-            ),
-            speed_stage,
+        self._write_search_audit(
+            batch_id, scope_id, speed_stage, self._current_rows(scope_id, platform, ELIGIBLE),
+            rejected, now, platform,
         )
-        self._write_ledger(scope_id, platform, cycle, ledger, now)
-        self._write_search_audit(batch_id, scope_id, speed_stage, ranked, rejected, now, platform)
-        qualified = self.next_qualified(scope_id)
+        candidates = self._rows_in_course_order(scope_id, platform, ELIGIBLE)
         return {
             "search_batch_id": batch_id,
             "scope_id": scope_id,
             "speed_stage": speed_stage,
-            "active_source": {"platform": platform, "cycle": cycle},
-            "candidates": ranked,
-            "pending_review": pending,
-            "quarantined": quarantined,
+            "active_source": {
+                "platform": platform,
+                "cycle": cycle,
+                "learning_level": ceiling,
+            },
+            "candidates": [_payload(row, platform) for row in candidates[:max_results]],
+            "deferred_by_level": [
+                _payload(row, platform)
+                for row in self._rows_in_course_order(scope_id, platform, PENDING)
+                if not is_level_allowed(row["cefr_level"], ceiling)
+            ],
+            "pending_review": [
+                _payload(row, platform)
+                for row in self._rows_in_course_order(scope_id, platform, PENDING_REVIEW)
+            ],
+            "quarantined": [
+                _payload(row, platform)
+                for row in self._rows_in_course_order(scope_id, platform, REJECTED)
+            ],
             "rejection_summary": rejected,
             "catalog": {
-                "catalog_complete": bool(ledger.get("catalog_complete")),
-                "catalog_scope": ledger.get("catalog_scope"),
-                "known_total": ledger.get("known_total"),
-                "has_cursor": bool(ledger.get("has_cursor")),
+                "catalog_complete": bool(catalog.get("catalog_complete")),
+                "catalog_scope": catalog.get("catalog_scope"),
+                "known_total": catalog.get("known_total"),
+                "has_cursor": bool(catalog.get("has_cursor")),
+                "discovered": catalog.get("discovered"),
             },
-            "next_qualified_candidate_id": None if qualified is None else qualified["candidate_id"],
+            "next_qualified_candidate_id": next(
+                (row["candidate_id"] for row in candidates), None
+            ),
         }
 
     def list_candidates(
@@ -831,9 +899,9 @@ class MaterialCandidateService:
     ) -> dict[str, object]:
         """Explicit human confirmation (approve) or rejection of a candidate.
 
-        Approval requires confirmed non-US accent, cleared license, known CEFR
-        level and verified transcript evidence; without them the item stays out
-        of the formal training library.
+        Approval requires the canonical en-GB accent, cleared license, known
+        CEFR level and verified transcript evidence; without them the item
+        stays out of the formal training library.
         """
         decision = str(decision).strip().upper()
         if decision not in ("APPROVE", "REJECT"):
@@ -842,7 +910,6 @@ class MaterialCandidateService:
         if active is None:
             raise SourceGovernanceError("SOURCE_NOT_APPROVED", "no active source to review against")
         platform = str(active["platform"])
-        cycle = int(active.get("cycle", 1))
         now = self.now_fn()
         with self.database.connect() as connection:
             candidate = connection.execute(
@@ -857,6 +924,10 @@ class MaterialCandidateService:
                 raise SourceGovernanceError(
                     "SOURCE_NOT_APPROVED", "candidate belongs to a non-active source"
                 )
+            if candidate["ingestion_status"] == INGESTED:
+                raise SourceGovernanceError(
+                    "CANDIDATE_ALREADY_INGESTED", "an ingested candidate cannot be re-reviewed"
+                )
             updates: dict[str, object] = {
                 "reviewed_by": reviewer,
                 "reviewed_at": now.isoformat(),
@@ -867,16 +938,16 @@ class MaterialCandidateService:
                 confirmed_accent = normalize_accent(
                     accent if accent is not None else candidate["accent"]
                 )
-                if confirmed_accent is None or confirmed_accent in EXCLUDED_ACCENTS:
+                if confirmed_accent != BRITISH_ACCENT:
                     raise SourceGovernanceError(
                         "ACCENT_NOT_ELIGIBLE",
-                        "approval requires a confirmed non-US accent with evidence",
+                        "approval requires the canonical en-GB accent with evidence",
                     )
                 if normalize_license(candidate["license_status"]) != LICENSE_CLEARED:
                     raise SourceGovernanceError(
                         "LICENSE_UNVERIFIED", "approval requires cleared source license"
                     )
-                if candidate["cefr_level"] not in CEFR_ORDER:
+                if str(candidate["cefr_level"] or "").upper() not in CEFR_ORDER:
                     raise SourceGovernanceError(
                         "CEFR_UNVERIFIED", "approval requires a verified CEFR level"
                     )
@@ -892,10 +963,18 @@ class MaterialCandidateService:
                     )
                 if candidate["audio_quality"] == "Poor":
                     raise SourceGovernanceError("QUALITY_POOR", "approval requires non-poor audio")
+                if not candidate["audio_path"]:
+                    # Nothing was downloaded (authorization or catalog gate):
+                    # the item stays processable instead of becoming a formal
+                    # material without audio.
+                    raise SourceGovernanceError(
+                        "AUDIO_NOT_ACQUIRED",
+                        "approval requires the original audio to be legally acquired",
+                    )
                 status, reason = ELIGIBLE, None
                 updates.update(
                     {
-                        "accent": confirmed_accent,
+                        "accent": BRITISH_ACCENT,
                         "accent_evidence": candidate["accent_evidence"] or f"review:{reviewer}",
                         "transcript_verified": 1,
                         "transcript_evidence": candidate["transcript_evidence"]
@@ -910,25 +989,6 @@ class MaterialCandidateService:
                 f"UPDATE material_candidates SET {assignments} WHERE candidate_id = ? AND scope_id = ?",
                 (*updates.values(), candidate_id, scope_id),
             )
-            ledger = _read_metadata(
-                connection, _LEDGER_KEY.format(scope=scope_id, platform=platform, cycle=cycle)
-            ) or _empty_ledger(scope_id, platform, cycle)
-            record = (ledger.get("items") or {}).get(candidate["provider_item_id"]) or {}
-            record.update(
-                {
-                    "disposition": status,
-                    "reason_code": reason,
-                    "reviewed_by": reviewer,
-                    "reviewed_at": now.isoformat(),
-                    "updated_at": now.isoformat(),
-                }
-            )
-            ledger.setdefault("items", {})[candidate["provider_item_id"]] = record
-            _write_metadata(
-                connection,
-                _LEDGER_KEY.format(scope=scope_id, platform=platform, cycle=cycle),
-                ledger,
-            )
         return {
             "candidate_id": candidate_id,
             "ingestion_status": status,
@@ -938,57 +998,23 @@ class MaterialCandidateService:
             "note": note,
         }
 
-    def mark_ingested(
-        self,
-        connection,
-        *,
-        scope_id: str,
-        platform: str,
-        item_id: str,
-        material_id: str,
-        now: datetime,
-    ) -> None:
-        """Record the ingestion in the persisted discovery ledger.
-
-        Called inside the ingestion transaction, so the ledger state and the
-        formal material are committed together.
-        """
-        active = self.active_source(scope_id, connection=connection)
-        if active is None:
-            return
-        cycle = int(active.get("cycle", 1))
-        ledger = _read_metadata(
-            connection, _LEDGER_KEY.format(scope=scope_id, platform=platform, cycle=cycle)
-        ) or _empty_ledger(scope_id, platform, cycle)
-        record = (ledger.get("items") or {}).get(item_id) or {}
-        record.update(
-            {
-                "disposition": INGESTED,
-                "reason_code": None,
-                "material_id": material_id,
-                "downloaded": True,
-                "updated_at": now.isoformat(),
-            }
-        )
-        ledger.setdefault("items", {})[item_id] = record
-        ledger["updated_at"] = now.isoformat()
-        _write_metadata(
-            connection,
-            _LEDGER_KEY.format(scope=scope_id, platform=platform, cycle=cycle),
-            ledger,
-        )
-
     def next_qualified(self, scope_id: str, connection=None) -> dict[str, object] | None:
-        """The single next ingestible item, in platform course order."""
+        """The single next ingestible item, in platform course order.
+
+        Only a processed, verified item within the confirmed CEFR learning
+        level qualifies; discovery can cross levels, ingestion cannot.
+        """
         with self._connection(connection) as conn:
             active = self.active_source(scope_id, connection=conn)
             if active is None:
                 return None
+            ceiling = confirmed_learning_level(conn, scope_id)
             rows = conn.execute(
                 """
                 SELECT * FROM material_candidates
                  WHERE scope_id = ? AND provider = ? AND ingestion_status = ?
                    AND candidate_status IN ('CANDIDATE', 'SELECTED')
+                   AND audio_path IS NOT NULL
                 """,
                 (scope_id, str(active["platform"]), ELIGIBLE),
             ).fetchall()
@@ -998,6 +1024,7 @@ class MaterialCandidateService:
             for row in rows
             if (expiry := _parse_timestamp(row["expires_at"])) is None or expiry >= now
         ]
+        usable = [row for row in usable if is_level_allowed(row["cefr_level"], ceiling)]
         if not usable:
             return None
         usable.sort(key=_course_key)
@@ -1022,18 +1049,6 @@ class MaterialCandidateService:
             f"{type(provider).__name__} exposes neither catalog_items nor _list_episodes",
         )
 
-    def _load_ledger(self, scope_id: str, platform: str, cycle: int, provider) -> dict[str, object]:
-        with self._connection() as connection:
-            stored = _read_metadata(
-                connection, _LEDGER_KEY.format(scope=scope_id, platform=platform, cycle=cycle)
-            )
-        ledger = stored if isinstance(stored, dict) else _empty_ledger(scope_id, platform, cycle)
-        ledger.setdefault("items", {})
-        declared = self._catalog_info(provider)
-        if declared is not None:
-            ledger.update(declared)
-        return ledger
-
     @staticmethod
     def _catalog_info(provider) -> dict[str, object] | None:
         """Provider-declared catalog snapshot; undeclared means 'unknown'."""
@@ -1054,44 +1069,322 @@ class MaterialCandidateService:
             "catalog_scope": raw.get("catalog_scope"),
         }
 
-    def _write_ledger(
-        self, scope_id: str, platform: str, cycle: int, ledger: dict[str, object], now: datetime
-    ) -> None:
-        ledger["updated_at"] = now.isoformat()
-        with self._connection() as connection:
-            _write_metadata(
-                connection,
-                _LEDGER_KEY.format(scope=scope_id, platform=platform, cycle=cycle),
-                ledger,
-            )
-
-    @staticmethod
-    def _record_item(
-        ledger: dict[str, object],
+    def _persist_discovery(
+        self,
+        connection,
+        *,
+        scope_id: str,
+        platform: str,
         item: dict[str, object],
         disposition: str,
         reason: str | None,
         batch_id: str,
+        speed_stage: str,
         now: datetime,
-        downloaded: bool = False,
-    ) -> None:
-        items = ledger.setdefault("items", {})
+    ) -> bool:
+        """Record one discovered entry; never overwrite a progressed row.
+
+        The row is the entry's only state record, so a re-run after a crash
+        keeps everything already learned about it (including a review or an
+        ingestion decision) instead of replacing it with fresh metadata.
+        """
         item_id = str(item["source_item_id"])
-        prior = items.get(item_id) or {}
-        items[item_id] = {
-            "title": item.get("title"),
-            "source_url": item.get("source_url"),
-            "source_course": item.get("source_course"),
-            "course_order": item.get("course_order"),
-            "item_order": item.get("item_order"),
-            "cefr_level": item.get("cefr_level"),
-            "accent": item.get("accent"),
-            "disposition": disposition,
-            "reason_code": reason,
-            "batch_id": batch_id,
-            "downloaded": bool(downloaded or prior.get("downloaded")),
-            "updated_at": now.isoformat(),
+        existing = connection.execute(
+            "SELECT candidate_id FROM material_candidates WHERE provider = ? AND provider_item_id = ?",
+            (platform, item_id),
+        ).fetchone()
+        if existing is not None:
+            return False
+        expires_at = now + timedelta(days=CANDIDATE_TTL_DAYS)
+        try:
+            connection.execute(
+                """
+                INSERT INTO material_candidates(
+                    candidate_id, scope_id, provider, provider_item_id, title, source_url,
+                    audio_url, transcript, duration_seconds, speed_stage, audio_quality,
+                    transcript_status, candidate_status, search_batch_id,
+                    content_fingerprint, created_at, expires_at,
+                    source_course, course_order, item_order, accent, speaker_id, cefr_level,
+                    transcript_verified, license_status, license_reference, ingestion_status,
+                    source_priority, transcript_origin, accent_evidence, transcript_evidence,
+                    failure_code
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, NULL,
+                    NULL, 'CANDIDATE', ?,
+                    ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?,
+                    ?, ?, ?, ?,
+                    ?
+                )
+                """,
+                (
+                    _candidate_id(platform, item_id), scope_id, platform, item_id,
+                    str(item["title"]), str(item["source_url"]),
+                    str(item["audio_url"]), item.get("transcript"),
+                    item.get("duration_seconds"), speed_stage,
+                    batch_id, _content_fingerprint(platform, item_id),
+                    now.isoformat(), expires_at.isoformat(),
+                    item.get("source_course"), item.get("course_order"), item.get("item_order"),
+                    item.get("accent"), item.get("speaker_id"), item.get("cefr_level"),
+                    1 if item.get("transcript_verified") else 0,
+                    normalize_license(item.get("license_status")), item.get("license_reference"),
+                    disposition,
+                    _platform_priority(platform), item.get("transcript_origin"),
+                    item.get("accent_evidence"), item.get("transcript_evidence"),
+                    reason,
+                ),
+            )
+        except sqlite3.IntegrityError:
+            # A concurrent discovery of the same identity already landed; the
+            # first record is the single source of truth.
+            return False
+        return True
+
+    def _processable(
+        self, scope_id: str, platform: str, ceiling: str, now: datetime
+    ) -> list[dict[str, object]]:
+        """Entries due for processing, in platform course order.
+
+        Only entries whose authorization is cleared are downloaded (an item
+        awaiting authorization is recorded without any download), and only
+        entries within the confirmed learning level are processed at all.
+        """
+        with self.database.connect() as connection:
+            # An expired but otherwise qualified entry is retried instead of
+            # being skipped forever: its audio and evidence are re-validated
+            # (the declared transcript is source metadata and is kept).
+            connection.execute(
+                """
+                UPDATE material_candidates
+                   SET ingestion_status = ?, audio_path = NULL,
+                       transcript_status = NULL, audio_quality = NULL,
+                       timestamped_sentences_json = NULL
+                 WHERE scope_id = ? AND provider = ? AND ingestion_status = ?
+                   AND expires_at IS NOT NULL AND expires_at < ?
+                """,
+                (PENDING, scope_id, platform, ELIGIBLE, now.isoformat()),
+            )
+            rows = connection.execute(
+                """
+                SELECT * FROM material_candidates
+                 WHERE scope_id = ? AND provider = ?
+                   AND (
+                        ingestion_status = ?
+                        OR (ingestion_status IN (?, ?) AND audio_path IS NULL)
+                   )
+                """,
+                (scope_id, platform, RETRYABLE_FAILED, PENDING, PENDING_REVIEW),
+            ).fetchall()
+        due = []
+        for row in rows:
+            if normalize_license(row["license_status"]) != LICENSE_CLEARED:
+                continue
+            if normalize_accent(row["accent"]) == US_ACCENT:
+                continue
+            if not is_level_allowed(row["cefr_level"], ceiling):
+                continue
+            if str(row["cefr_level"] or "").upper() not in CEFR_ORDER:
+                continue
+            due.append(dict(row))
+        due.sort(key=_course_key)
+        return due
+
+    def _process_row(
+        self,
+        provider,
+        row: dict[str, object],
+        *,
+        scope_id: str,
+        platform: str,
+        batch_id: str,
+        now: datetime,
+        speed_stage: str,
+        lower: float | None,
+        upper: float | None,
+        work_dir: Path,
+    ) -> tuple[str | None, str | None]:
+        """Download, grade and transcribe one entry; persist the outcome."""
+        item_id = str(row["provider_item_id"])
+        item = {
+            "source_item_id": item_id,
+            "source_url": row["source_url"],
+            "audio_url": row["audio_url"],
+            "transcript": row["transcript"],
+            "transcript_origin": row["transcript_origin"],
+            "transcript_verified": bool(row["transcript_verified"]),
+            "accent": row["accent"],
+            "cefr_level": row["cefr_level"],
+            "license_status": row["license_status"],
+            "title": row["title"],
+            "source_course": row["source_course"],
+            "course_order": row["course_order"],
+            "item_order": row["item_order"],
         }
+        prior_reason = row["failure_code"]
+        metadata_disposition, metadata_reason = assess_disposition(item)
+        try:
+            audio_path = self._fetch_audio(provider, item, work_dir)
+        except Exception:
+            self._update_processed(
+                row["candidate_id"], RETRYABLE_FAILED, "DOWNLOAD_FAILED", audio_path=None
+            )
+            return None, "download_failed"
+
+        quality = self._analyze_audio(audio_path)
+        if quality is None:
+            self._update_processed(
+                row["candidate_id"], RETRYABLE_FAILED, "AUDIO_UNREADABLE", audio_path=str(audio_path)
+            )
+            return None, "quality_failed"
+        if quality.level == "Poor":
+            self._audio_report(row["candidate_id"], quality, now)
+            self._update_processed(
+                row["candidate_id"], REJECTED, "QUALITY_POOR",
+                audio_path=str(audio_path), quality=quality,
+            )
+            return REJECTED, "quality_poor"
+        if not _duration_in_band(quality.duration_seconds, lower, upper):
+            self._audio_report(row["candidate_id"], quality, now)
+            self._update_processed(
+                row["candidate_id"], OUT_OF_SCOPE, "DURATION_OUT_OF_SCOPE",
+                audio_path=str(audio_path), quality=quality,
+            )
+            return OUT_OF_SCOPE, "duration_out_of_range"
+
+        try:
+            segments = self._retry(lambda: self.asr.transcribe(str(audio_path)))
+        except Exception:
+            self._audio_report(row["candidate_id"], quality, now)
+            self._update_processed(
+                row["candidate_id"], RETRYABLE_FAILED, "ASR_FAILED",
+                audio_path=str(audio_path), quality=quality,
+            )
+            return None, "transcribe_failed"
+
+        official = str(item.get("transcript") or "").strip()
+        asr_text = " ".join(segment.text for segment in segments).strip()
+        if str(item.get("transcript_origin") or "").upper() == OFFICIAL_ORIGIN and official:
+            transcript = official
+            agreement = transcript_agreement(official, asr_text)
+        else:
+            transcript = asr_text
+            agreement = None
+        sentences = split_sentences(transcript) if transcript else []
+        aligned = align_sentences(sentences, segments) if sentences else []
+        validation = validate_transcript(
+            transcript, aligned, quality.duration_seconds, MIN_COVERAGE, MIN_SENTENCES
+        )
+        if validation.status != "COMPLETE":
+            self._audio_report(row["candidate_id"], quality, now)
+            self._update_processed(
+                row["candidate_id"], REJECTED, f"TRANSCRIPT_{validation.status}",
+                audio_path=str(audio_path), quality=quality,
+            )
+            return REJECTED, f"transcript_{validation.status.lower()}"
+
+        verification = transcript_verification(
+            validation,
+            item.get("transcript_origin"),
+            bool(item.get("transcript_verified")),
+            agreement,
+        )
+        if verification == TRANSCRIPT_VERIFIED and metadata_disposition == ELIGIBLE:
+            final_disposition, final_reason = ELIGIBLE, None
+        else:
+            final_disposition = PENDING_REVIEW
+            if verification == CONTRADICTED:
+                final_reason = "TRANSCRIPT_CONTRADICTED"
+            else:
+                final_reason = metadata_reason or prior_reason or "TRANSCRIPT_UNVERIFIED"
+        self._audio_report(row["candidate_id"], quality, now)
+        self._update_processed(
+            row["candidate_id"], final_disposition, final_reason,
+            audio_path=str(audio_path), quality=quality, transcript=transcript,
+            aligned=aligned, transcript_status=validation.status,
+            expires_at=now + timedelta(days=CANDIDATE_TTL_DAYS),
+        )
+        return final_disposition, None
+
+    def _update_processed(
+        self,
+        candidate_id: str,
+        disposition: str,
+        reason: str | None,
+        *,
+        audio_path: str | None = None,
+        quality=None,
+        transcript: str | None = None,
+        aligned: list[tuple[str, float, float]] | None = None,
+        transcript_status: str | None = None,
+        expires_at: datetime | None = None,
+    ) -> None:
+        fields: dict[str, object] = {
+            "ingestion_status": disposition,
+            "failure_code": reason,
+            "audio_path": audio_path,
+        }
+        if quality is not None:
+            fields["audio_quality"] = quality.level
+            fields["duration_seconds"] = quality.duration_seconds
+        if transcript is not None:
+            fields["transcript"] = transcript
+        if aligned is not None:
+            fields["timestamped_sentences_json"] = encode_timestamped(aligned)
+        if transcript_status is not None:
+            fields["transcript_status"] = transcript_status
+        if expires_at is not None:
+            fields["expires_at"] = expires_at.isoformat()
+        assignments = ", ".join(f"{column} = ?" for column in fields)
+        with self.database.connect() as connection:
+            connection.execute(
+                f"""
+                UPDATE material_candidates
+                   SET {assignments}, attempt_count = attempt_count + 1
+                 WHERE candidate_id = ?
+                """,
+                (*fields.values(), candidate_id),
+            )
+
+    def _audio_report(self, candidate_id: str, quality, now: datetime) -> None:
+        """Persist the quality evidence for one processed candidate."""
+        report_id = str(uuid4())
+        with self.database.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO audio_quality_reports(
+                    report_id, candidate_id, audio_fingerprint, quality_level, metrics_json,
+                    threshold_config_version, analyzer_version, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    report_id, candidate_id, quality.fingerprint, quality.level,
+                    _quality_metrics(quality), THRESHOLD_CONFIG_VERSION, ANALYZER_VERSION,
+                    now.isoformat(),
+                ),
+            )
+            connection.execute(
+                "UPDATE material_candidates SET audio_quality_report_id = ? WHERE candidate_id = ?",
+                (report_id, candidate_id),
+            )
+
+    def _current_rows(self, scope_id: str, platform: str, disposition: str) -> list:
+        with self.database.connect() as connection:
+            return connection.execute(
+                """
+                SELECT * FROM material_candidates
+                 WHERE scope_id = ? AND provider = ? AND ingestion_status = ?
+                """,
+                (scope_id, platform, disposition),
+            ).fetchall()
+
+    def _rows_in_course_order(
+        self, scope_id: str, platform: str, disposition: str
+    ) -> list[dict[str, object]]:
+        rows = [dict(row) for row in self._current_rows(scope_id, platform, disposition)]
+        rows.sort(key=_course_key)
+        return rows
 
     def _fetch_audio(self, provider, item: dict[str, object], work_dir: Path) -> Path:
         """Download into a staging area and publish atomically.
@@ -1127,22 +1420,12 @@ class MaterialCandidateService:
             return None
         return quality
 
-    @staticmethod
-    def _transcript_for(item: dict[str, object], segments) -> tuple[str, list[tuple[str, float, float]]]:
-        official = str(item.get("transcript") or "").strip()
-        if str(item.get("transcript_origin") or "").upper() == OFFICIAL_ORIGIN and official:
-            transcript = official
-        else:
-            transcript = " ".join(segment.text for segment in segments).strip()
-        sentences = split_sentences(transcript) if transcript else []
-        return transcript, align_sentences(sentences, segments) if sentences else []
-
     def _write_search_audit(
         self,
         batch_id: str,
         scope_id: str,
         speed_stage: str,
-        candidates: list[dict[str, object]],
+        candidates: list,
         rejected: dict[str, int],
         now: datetime,
         platform: str,
@@ -1178,166 +1461,6 @@ class MaterialCandidateService:
                     _time.sleep(RETRY_BACKOFF_SECONDS * (attempt + 1))
         raise last_error  # type: ignore[misc]
 
-    def _rank(
-        self,
-        candidates: list[dict[str, object]],
-        duration_min: float,
-        duration_max: float,
-        speed_stage: str,
-    ) -> list[dict[str, object]]:
-        # Ordering per P1 3.1: quality, transcript completeness, duration
-        # closeness to the band middle, then speech-rate closeness to the
-        # stage target. Clear pool first; Acceptable tops up only when the
-        # Clear pool is below three.
-        mid = (duration_min + duration_max) / 2.0
-        stage_target_wpm = STAGE_WPM_TARGETS.get(speed_stage, 120.0)
-        ordered = sorted(
-            candidates,
-            key=lambda c: (
-                0 if c["audio_quality"] == "Clear" else 1,
-                0 if c.get("transcript_status") == "COMPLETE" else 1,
-                abs(float(c["duration_seconds"]) - mid * 60),
-                abs(float(c.get("speech_rate_wpm") or 0) - stage_target_wpm),
-            ),
-        )
-        clears = [c for c in ordered if c["audio_quality"] == "Clear"]
-        acceptable = [c for c in ordered if c["audio_quality"] == "Acceptable"]
-        return (clears + acceptable)[:3]
-
-    def _store_candidate(
-        self,
-        *,
-        candidate_id: str,
-        scope_id: str,
-        platform: str,
-        item: dict[str, object],
-        transcript: str,
-        aligned: list[tuple[str, float, float]],
-        duration_seconds: float,
-        speed_stage: str,
-        quality,
-        report_id: str,
-        transcript_status: str,
-        batch_id: str,
-        fingerprint: str,
-        audio_path: Path,
-        disposition: str,
-        reason: str | None,
-        now: datetime,
-    ) -> bool:
-        expires_at = now + timedelta(days=CANDIDATE_TTL_DAYS)
-        params = {
-            "candidate_id": candidate_id,
-            "scope_id": scope_id,
-            "platform": platform,
-            "item_id": str(item["source_item_id"]),
-            "title": str(item["title"]),
-            "source_url": str(item["source_url"]),
-            "audio_url": str(item["audio_url"]),
-            "transcript": transcript,
-            "duration": duration_seconds,
-            "speed_stage": speed_stage,
-            "quality": quality.level,
-            "report_id": report_id,
-            "transcript_status": transcript_status,
-            "batch_id": batch_id,
-            "fingerprint": fingerprint,
-            "audio_path": str(audio_path),
-            "aligned": encode_timestamped(aligned),
-            "created_at": now.isoformat(),
-            "expires_at": expires_at.isoformat(),
-            "source_course": item.get("source_course"),
-            "course_order": item.get("course_order"),
-            "item_order": item.get("item_order"),
-            "accent": item.get("accent"),
-            "speaker_id": item.get("speaker_id"),
-            "cefr_level": item.get("cefr_level"),
-            "transcript_verified": 1 if item.get("transcript_verified") else 0,
-            "license_status": normalize_license(item.get("license_status")),
-            "license_reference": item.get("license_reference"),
-            "ingestion_status": disposition,
-            "source_priority": _platform_priority(platform),
-            "transcript_origin": item.get("transcript_origin"),
-            "accent_evidence": item.get("accent_evidence"),
-            "transcript_evidence": item.get("transcript_evidence"),
-            "failure_code": reason,
-        }
-        try:
-            with self.database.connect() as connection:
-                connection.execute(
-                    """
-                    INSERT INTO material_candidates(
-                        candidate_id, scope_id, provider, provider_item_id, title, source_url,
-                        audio_url, transcript, duration_seconds, speed_stage, audio_quality,
-                        audio_quality_report_id, transcript_status, candidate_status,
-                        search_batch_id, content_fingerprint, audio_path,
-                        timestamped_sentences_json, created_at, expires_at,
-                        source_course, course_order, item_order, accent, speaker_id, cefr_level,
-                        transcript_verified, license_status, license_reference, ingestion_status,
-                        source_priority, transcript_origin, accent_evidence, transcript_evidence,
-                        failure_code
-                    ) VALUES (
-                        :candidate_id, :scope_id, :platform, :item_id, :title, :source_url,
-                        :audio_url, :transcript, :duration, :speed_stage, :quality,
-                        :report_id, :transcript_status, 'CANDIDATE',
-                        :batch_id, :fingerprint, :audio_path,
-                        :aligned, :created_at, :expires_at,
-                        :source_course, :course_order, :item_order, :accent, :speaker_id, :cefr_level,
-                        :transcript_verified, :license_status, :license_reference, :ingestion_status,
-                        :source_priority, :transcript_origin, :accent_evidence, :transcript_evidence,
-                        :failure_code
-                    )
-                    """,
-                    params,
-                )
-                connection.execute(
-                    """
-                    INSERT INTO audio_quality_reports(
-                        report_id, candidate_id, audio_fingerprint, quality_level, metrics_json,
-                        threshold_config_version, analyzer_version, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        report_id, candidate_id, quality.fingerprint, quality.level,
-                        _quality_metrics(quality), THRESHOLD_CONFIG_VERSION, ANALYZER_VERSION,
-                        now.isoformat(),
-                    ),
-                )
-        except sqlite3.IntegrityError:
-            # A duplicate identity (alias URL, another batch, another scope) is
-            # not an error: the persisted list keeps the first record.
-            return False
-        return True
-
-    def _candidate_record(self, platform: str, item_id: str, scope_id: str, fingerprint: str):
-        """Persisted record for this source identity (or this URL alias).
-
-        Identity is (platform, item id) regardless of URL, batch or scope; the
-        per-scope content fingerprint is the fallback so an alias URL of the
-        same resource cannot create a second record.
-        """
-        with self.database.connect() as connection:
-            row = connection.execute(
-                """
-                SELECT ingestion_status, failure_code, audio_path
-                  FROM material_candidates
-                 WHERE provider = ? AND provider_item_id = ?
-                 LIMIT 1
-                """,
-                (platform, item_id),
-            ).fetchone()
-            if row is None:
-                row = connection.execute(
-                    """
-                    SELECT ingestion_status, failure_code, audio_path
-                      FROM material_candidates
-                     WHERE scope_id = ? AND content_fingerprint = ?
-                     LIMIT 1
-                    """,
-                    (scope_id, fingerprint),
-                ).fetchone()
-        return row
-
 
 def _platform_priority(platform: str) -> int:
     return SOURCE_ORDER.index(platform) + 1 if platform in SOURCE_ORDER else 99
@@ -1356,74 +1479,107 @@ def _safe_audio_id(item_id: str) -> str:
     return f"{cleaned}-{uuid4().hex[:8]}"
 
 
-def _public_item(item: dict[str, object], disposition: str, reason: str | None) -> dict[str, object]:
-    """Metadata-only view of a quarantined item: no transcript text."""
+def _catalog_snapshot(declared: dict[str, object] | None, active: dict, items: list) -> dict:
+    """Catalog evidence for the current cycle.
+
+    A declared snapshot is only accepted as evidence of the *catalog scope*;
+    the number of entries actually discovered is always derived from the
+    persisted list, and an undeclared snapshot never claims completion.
+    """
+    if declared is None:
+        return {
+            "catalog_complete": False,
+            "known_total": None,
+            "has_cursor": True,
+            "catalog_scope": active.get("catalog_scope"),
+            "discovered": len(items),
+        }
     return {
-        "provider_item_id": item.get("source_item_id"),
-        "title": item.get("title"),
-        "source_url": item.get("source_url"),
-        "source_course": item.get("source_course"),
-        "item_order": item.get("item_order"),
-        "cefr_level": item.get("cefr_level"),
-        "accent": item.get("accent"),
-        "ingestion_status": disposition,
-        "reason_code": reason,
+        "catalog_complete": bool(declared.get("catalog_complete")),
+        "known_total": declared.get("known_total"),
+        "has_cursor": bool(declared.get("has_cursor", False)),
+        "catalog_scope": declared.get("catalog_scope") or active.get("catalog_scope"),
+        "discovered": len(items),
     }
 
 
-def _empty_ledger(scope_id: str, platform: str, cycle: int) -> dict[str, object]:
+def _payload(row, platform: str) -> dict[str, object]:
+    """Public view of one candidate (metadata only, never the transcript)."""
+    duration = row["duration_seconds"]
+    transcript = row["transcript"]
+    wpm = None
+    if duration and transcript:
+        words = len(str(transcript).split())
+        wpm = round(words / (float(duration) / 60.0), 1) if duration else None
     return {
-        "scope_id": scope_id,
-        "platform": platform,
-        "cycle": cycle,
-        # Undeclared snapshots are unknown: completion is never claimed and
-        # ratios are reported as unknown rather than as 100%.
-        "catalog_complete": False,
-        "known_total": None,
-        "has_cursor": True,
-        "catalog_scope": None,
-        "items": {},
-        "updated_at": None,
+        "candidate_id": row["candidate_id"],
+        "provider": row["provider"] or platform,
+        "provider_item_id": row["provider_item_id"],
+        "title": row["title"],
+        "duration_seconds": None if duration is None else round(float(duration), 1),
+        "speed_stage": row["speed_stage"],
+        "audio_quality": row["audio_quality"],
+        "transcript_status": row["transcript_status"],
+        "candidate_status": row["candidate_status"],
+        "speech_rate_wpm": wpm,
+        "cefr_level": row["cefr_level"],
+        "accent": row["accent"],
+        "source_course": row["source_course"],
+        "item_order": row["item_order"],
+        "ingestion_status": row["ingestion_status"],
+        "reason_code": row["failure_code"],
     }
 
 
-def _build_report(
-    ledger: dict[str, object], scope_id: str, platform: str, cycle: int, generated_at: str
-) -> dict[str, object]:
-    items = ledger.get("items") or {}
+def _build_report(connection, scope_id: str, active: dict, generated_at: str) -> dict[str, object]:
+    """Report the current persisted state; nothing is read from a side ledger."""
+    platform = str(active["platform"])
+    cycle = int(active.get("cycle", 1))
+    catalog = active.get("catalog") or {}
+    ceiling = confirmed_learning_level(connection, scope_id)
+    rows = connection.execute(
+        """
+        SELECT provider_item_id, ingestion_status, failure_code, cefr_level, audio_path
+          FROM material_candidates
+         WHERE scope_id = ? AND provider = ?
+         ORDER BY provider_item_id
+        """,
+        (scope_id, platform),
+    ).fetchall()
     dispositions: dict[str, int] = {}
     downloaded = 0
-    for record in items.values():
-        disposition = str(record.get("disposition"))
+    pending_manual: list[str] = []
+    retryable: list[str] = []
+    qualified_unprocessed: list[str] = []
+    pending_processing: list[str] = []
+    deferred: list[str] = []
+    for row in rows:
+        disposition = str(row["ingestion_status"])
         dispositions[disposition] = dispositions.get(disposition, 0) + 1
-        if record.get("downloaded"):
+        if row["audio_path"]:
             downloaded += 1
-    discovered = len(items)
-    known_total = ledger.get("known_total")
-    pending_manual = [
-        item_id
-        for item_id, record in items.items()
-        if record.get("disposition") == PENDING_REVIEW
-    ]
-    retryable = [
-        item_id
-        for item_id, record in items.items()
-        if record.get("disposition") == RETRYABLE_FAILED
-    ]
-    qualified_unprocessed = [
-        item_id for item_id, record in items.items() if record.get("disposition") == ELIGIBLE
-    ]
-    pending_processing = [
-        item_id for item_id, record in items.items() if record.get("disposition") == PENDING
-    ]
+        item_id = str(row["provider_item_id"])
+        if disposition == PENDING_REVIEW:
+            pending_manual.append(item_id)
+        elif disposition == RETRYABLE_FAILED:
+            retryable.append(item_id)
+        elif disposition == ELIGIBLE:
+            qualified_unprocessed.append(item_id)
+        elif disposition == PENDING:
+            if is_level_allowed(row["cefr_level"], ceiling):
+                pending_processing.append(item_id)
+            else:
+                deferred.append(item_id)
+    discovered = len(rows)
+    known_total = catalog.get("known_total")
+    catalog_complete = bool(catalog.get("catalog_complete"))
+    has_cursor = bool(catalog.get("has_cursor"))
     blocking = retryable + qualified_unprocessed + pending_processing
-    catalog_complete = bool(ledger.get("catalog_complete"))
-    has_cursor = bool(ledger.get("has_cursor"))
     if not catalog_complete or has_cursor:
         completion_status = "INCOMPLETE"
     elif known_total is None:
         completion_status = "UNKNOWN_TOTAL"
-    elif blocking:
+    elif discovered != int(known_total) or blocking:
         completion_status = "INCOMPLETE"
     else:
         completion_status = "COMPLETE"
@@ -1434,7 +1590,7 @@ def _build_report(
         "cycle": cycle,
         "generated_at": generated_at,
         "catalog_complete": catalog_complete,
-        "catalog_scope": ledger.get("catalog_scope"),
+        "catalog_scope": catalog.get("catalog_scope"),
         "has_cursor": has_cursor,
         "known_total": known_total,
         "discovered": discovered,
@@ -1449,8 +1605,47 @@ def _build_report(
         "pending_manual_items": pending_manual,
         "retryable_failures": retryable,
         "qualified_unprocessed": qualified_unprocessed,
+        "pending_processing": pending_processing,
+        "deferred_items": deferred,
+        "beyond_learning_level": deferred,
+        "learning_level": ceiling,
         "completion_status": completion_status,
+        "state_fingerprint": _state_fingerprint(rows, catalog, ceiling),
     }
+
+
+def _state_fingerprint(rows, catalog: dict, ceiling: str) -> str:
+    """Content hash of the current discovery/review/ingestion state.
+
+    Used to bind a confirmation to the exact state the report described: any
+    new discovery, review decision, ingestion or catalog change moves the hash,
+    so an old report (and its confirmation) becomes stale.
+    """
+    payload = {
+        "items": [
+            [
+                row["provider_item_id"],
+                row["ingestion_status"],
+                row["failure_code"],
+                row["cefr_level"],
+                1 if row["audio_path"] else 0,
+            ]
+            for row in rows
+        ],
+        "catalog": {
+            "catalog_complete": bool(catalog.get("catalog_complete")),
+            "known_total": catalog.get("known_total"),
+            "has_cursor": bool(catalog.get("has_cursor")),
+            "catalog_scope": catalog.get("catalog_scope"),
+        },
+        "learning_level": ceiling,
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:32]
+
+
+def report_pending(report: dict[str, object]) -> list[str]:
+    """Items a switch decision acknowledges (manual review + level deferral)."""
+    return [*report.get("pending_manual_items", []), *report.get("deferred_items", [])]
 
 
 def _report_summary(report: dict[str, object]) -> dict[str, object]:
@@ -1465,24 +1660,22 @@ def _report_summary(report: dict[str, object]) -> dict[str, object]:
         "remaining_items",
         "pending_manual_items",
         "retryable_failures",
+        "beyond_learning_level",
+        "learning_level",
     )
     return {key: report.get(key) for key in keys}
 
 
-def _ledger_summary(ledger: dict[str, object]) -> dict[str, object]:
-    items = ledger.get("items") or {}
-    dispositions: dict[str, int] = {}
-    for record in items.values():
-        disposition = str(record.get("disposition"))
-        dispositions[disposition] = dispositions.get(disposition, 0) + 1
+def _catalog_summary(active: dict) -> dict[str, object]:
+    catalog = active.get("catalog") or {}
     return {
-        "discovered": len(items),
-        "dispositions": dispositions,
-        "catalog_complete": bool(ledger.get("catalog_complete")),
-        "has_cursor": bool(ledger.get("has_cursor")),
-        "known_total": ledger.get("known_total"),
-        "catalog_scope": ledger.get("catalog_scope"),
-        "updated_at": ledger.get("updated_at"),
+        "catalog_complete": bool(catalog.get("catalog_complete")),
+        "has_cursor": bool(catalog.get("has_cursor")),
+        "known_total": catalog.get("known_total"),
+        "catalog_scope": catalog.get("catalog_scope"),
+        "discovered": catalog.get("discovered"),
+        "updated_at": active.get("catalog_updated_at"),
+        "learning_level": active.get("learning_level"),
     }
 
 
@@ -1496,6 +1689,7 @@ def _quality_metrics(quality) -> str:
             "sample_rate": quality.sample_rate,
             "duration_seconds": round(quality.duration_seconds, 2),
             "fingerprint": quality.fingerprint,
+            "noise_floor_measured": bool(quality.noise_floor_measured),
         },
         sort_keys=True,
     )

@@ -15,7 +15,7 @@ validation.
 from __future__ import annotations
 
 import threading
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -24,6 +24,7 @@ from fastapi.testclient import TestClient
 from app import main as main_module
 from app.adapters.speech import RecognizedSegment
 from app.core.audio_quality import AudioQualityAnalyzer, QualityThresholds
+from app.core.difficulty_progression import DifficultyProgressionService
 from app.core.material_candidates import (
     ELIGIBLE,
     INGESTED,
@@ -32,10 +33,13 @@ from app.core.material_candidates import (
     RETRYABLE_FAILED,
     MaterialCandidateService,
     SourceGovernanceError,
+    assess_disposition,
+    normalize_accent,
 )
 from app.core.material_preparation import MaterialPreparationService, MaterialSelectionError
 from app.core.material_search import MaterialSearchService
 from app.core.materials import MaterialStore
+from app.core.weekly import WeeklyAssessmentService
 from app.db.connection import Database
 from tests.fixtures import make_database, make_settings, make_sine_wav
 
@@ -49,16 +53,21 @@ OFFICIAL_TRANSCRIPT = " ".join(
 
 
 class FakeASR:
-    """Deterministic sentence-shaped segments spanning the fixture audio."""
+    """Deterministic ASR segments that agree with the fixture official script.
+
+    An official transcript that an independent ASR pass contradicts is
+    quarantined, so the positive fixtures must be self-consistent; the
+    contradiction case has its own negative test.
+    """
 
     def transcribe(self, audio_path: str) -> list[RecognizedSegment]:
         return [
             RecognizedSegment(
-                text=f"Sample sentence number {index} has enough words.",
-                start_time=index * 1.9,
-                end_time=index * 1.9 + 1.8,
+                text=f"This is the official sentence number {index} of the lesson.",
+                start_time=(index - 1) * 5.4,
+                end_time=(index - 1) * 5.4 + 5.35,
             )
-            for index in range(32)
+            for index in range(1, 13)
         ]
 
 
@@ -304,33 +313,83 @@ def test_en_us_is_excluded_from_discovery_import_and_ingestion(tmp_path: Path) -
 
 
 # ---------------------------------------------------------------------------
-# 3. Strict platform course order
+# 2b. Only the canonical British accent is eligible
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("accent", ["en-AU", "en-IE", "en_IN", "mixed", "unknown", "klingon", "au"])
+def test_non_british_accents_never_become_eligible(accent: str) -> None:
+    """Repro 1: only the canonical en-GB may pass the metadata disposition."""
+    disposition, _ = assess_disposition(item("acc-centre", accent=accent))
+    assert disposition != ELIGIBLE
+    assert normalize_accent(accent) != "en-GB"
+
+
+def test_non_british_accent_is_recorded_and_never_ingested(tmp_path: Path) -> None:
+    provider = FakeGovernedProvider([item("au-1", accent="en-AU"), item("uk-1")])
+    database, service = _service(tmp_path, provider)
+    _activate(service)
+    result = service.search(scope_id="default")
+    assert [candidate["provider_item_id"] for candidate in result["candidates"]] == ["uk-1"]
+
+    listing = {row["provider_item_id"]: row for row in service.list_candidates("default")}
+    # The declared accent is recorded verbatim, never silently rewritten.
+    assert listing["au-1"]["accent"] == "en-AU"
+    assert listing["au-1"]["ingestion_status"] == PENDING_REVIEW
+    assert listing["au-1"]["failure_code"] == "ACCENT_NOT_UK"
+
+    preparation = _preparation(database, tmp_path)
+    with pytest.raises(MaterialSelectionError) as exc:
+        preparation.prepare(listing["au-1"]["candidate_id"], "default", "key-au")
+    assert exc.value.code == "SOURCE_PENDING_REVIEW"
+
+
+# ---------------------------------------------------------------------------
+# 3. Strict platform course order (discovery first, then ordering)
 # ---------------------------------------------------------------------------
 
 def test_course_order_cannot_be_bypassed(tmp_path: Path) -> None:
     provider = FakeGovernedProvider([
+        item("a1-lesson-2", cefr_level="A1", course="course-a", course_order=1, item_order=2),
         item("a1-lesson-1", cefr_level="A1", course="course-a", course_order=1, item_order=1),
-        item("a2-lesson-1", cefr_level="A2", course="course-a", course_order=2, item_order=1),
+        item("a1-course-b", cefr_level="A1", course="course-b", course_order=2, item_order=1),
+        item("a2-lesson-1", cefr_level="A2", course="course-a", course_order=1, item_order=3),
         item("b1-lesson-1", cefr_level="B1", course="course-b", course_order=1, item_order=1),
     ])
     database, service = _service(tmp_path, provider)
     _activate(service)
     result = service.search(scope_id="default")
-    assert len(result["candidates"]) == 3
+    # Provider order is ignored: the platform course order (CEFR, course order,
+    # lesson order) decides, and course_order precedes the course name.
+    assert [candidate["provider_item_id"] for candidate in result["candidates"]] == [
+        "a1-lesson-1",
+        "a1-lesson-2",
+        "a1-course-b",
+    ]
+    # Higher levels are discovered and persisted, but the confirmed learning
+    # level (A1) keeps them out of the processing/ingestion queue.
+    assert {row["provider_item_id"] for row in result["deferred_by_level"]} == {
+        "a2-lesson-1",
+        "b1-lesson-1",
+    }
 
     qualified = service.next_qualified("default")
     assert qualified["provider_item_id"] == "a1-lesson-1"
 
     preparation = _preparation(database, tmp_path)
-    by_item = {candidate["provider_item_id"]: candidate["candidate_id"] for candidate in result["candidates"]}
-    for later in ("a2-lesson-1", "b1-lesson-1"):
+    by_item = {row["provider_item_id"]: row["candidate_id"] for row in service.list_candidates("default")}
+    for later in ("a1-lesson-2", "a1-course-b"):
         with pytest.raises(MaterialSelectionError) as exc:
             preparation.prepare(by_item[later], "default", f"key-{later}")
         assert exc.value.code == "COURSE_ORDER_VIOLATION"
+    for higher in ("a2-lesson-1", "b1-lesson-1"):
+        with pytest.raises(MaterialSelectionError) as exc:
+            preparation.prepare(by_item[higher], "default", f"key-{higher}")
+        assert exc.value.code == "LEARNING_LEVEL_NOT_CONFIRMED"
 
     prepared = preparation.prepare(by_item["a1-lesson-1"], "default", "key-a1")
     assert prepared["prepare_status"] == "READY"
-    assert service.next_qualified("default")["provider_item_id"] == "a2-lesson-1"
+    assert prepared["material_id"] == f"{PLATFORM}:a1-lesson-1"
+    assert service.next_qualified("default")["provider_item_id"] == "a1-lesson-2"
 
     with database.connect() as connection:
         material = connection.execute(
@@ -346,6 +405,28 @@ def test_course_order_cannot_be_bypassed(tmp_path: Path) -> None:
     assert material["transcript_verified"] == 1
     assert material["source_platform"] == PLATFORM
     assert candidate["ingestion_status"] == INGESTED
+
+
+def test_discovery_persists_the_whole_catalog_before_ordered_processing(tmp_path: Path) -> None:
+    """Repro 2: a B1 entry listed first must not be the first download."""
+    provider = FakeGovernedProvider([
+        item("b1-item", cefr_level="B1", course="course-a", course_order=1, item_order=1),
+        item("a1-item", cefr_level="A1", course="course-a", course_order=1, item_order=2),
+    ])
+    database, service = _service(tmp_path, provider)
+    _activate(service)
+    result = service.search(scope_id="default", max_results=1)
+
+    assert [candidate["provider_item_id"] for candidate in result["candidates"]] == ["a1-item"]
+    assert provider.downloads, "the qualified entry must be fetched"
+    assert all("b1-item" not in download for download in provider.downloads)
+    # The complete catalog list is persisted before anything is downloaded, so
+    # the deferred B1 entry is visible instead of being lost.
+    persisted = {row["provider_item_id"]: row for row in service.list_candidates("default")}
+    assert set(persisted) == {"b1-item", "a1-item"}
+    assert persisted["b1-item"]["ingestion_status"] == "PENDING"
+    assert persisted["b1-item"]["audio_quality"] is None
+    assert service.next_qualified("default")["provider_item_id"] == "a1-item"
 
 
 # ---------------------------------------------------------------------------
@@ -693,6 +774,282 @@ def test_switch_is_rejected_while_retryable_failures_remain(tmp_path: Path) -> N
 
 
 # ---------------------------------------------------------------------------
+# 8b. Report version, catalog completeness, source lock, authorization
+# ---------------------------------------------------------------------------
+
+class WeekClock:
+    """Advancing clock for the eight-week confirmation records."""
+
+    def __init__(self) -> None:
+        self.now = NOW
+
+    def advance_weeks(self, weeks: int) -> None:
+        self.now = self.now + timedelta(days=7 * weeks)
+
+
+def test_report_is_invalidated_by_later_discovery(tmp_path: Path) -> None:
+    """Repro 3: a report generated on an empty catalog cannot be reused."""
+    provider = FakeGovernedProvider([])
+    _, service = _service(tmp_path, provider)
+    _activate(service)
+    service.search(scope_id="default")
+    report = service.report("default")
+    assert report["completion_status"] == "COMPLETE"
+
+    # A qualified entry appears after the report was generated.
+    provider.items = [item("late-1")]
+    provider.catalog = {
+        "catalog_complete": True,
+        "known_total": 1,
+        "has_cursor": False,
+        "catalog_scope": "fixture-snapshot",
+    }
+    service.search(scope_id="default")
+
+    with pytest.raises(SourceGovernanceError) as exc:
+        service.confirm_switch(
+            "default", report["report_id"], NEXT_PLATFORM, "license", "scope",
+            acknowledge_pending=True,
+        )
+    assert exc.value.code == "CONFIRMATION_STALE"
+
+    fresh = service.report("default")
+    assert fresh["report_id"] != report["report_id"]
+    assert fresh["discovered"] == 1
+
+
+def test_switch_is_blocked_while_catalog_entries_are_undiscovered(tmp_path: Path) -> None:
+    """Repro 4: a declared total of five with three discovered is not complete."""
+    provider = FakeGovernedProvider(
+        [item("a1", item_order=1), item("a2", item_order=2), item("a3", item_order=3)],
+        catalog={
+            "catalog_complete": True,
+            "known_total": 5,
+            "has_cursor": False,
+            "catalog_scope": "page-1-of-1",
+        },
+    )
+    database, service = _service(tmp_path, provider)
+    _activate(service)
+    service.search(scope_id="default")
+    report = service.report("default")
+    assert report["discovered"] == 3
+    assert report["known_total"] == 5
+    assert report["completion_status"] == "INCOMPLETE"
+
+    preparation = _preparation(database, tmp_path)
+    for key in ("key-a1", "key-a2", "key-a3"):
+        preparation.prepare_next("default", key)
+
+    report = service.report("default")
+    assert report["dispositions"].get(INGESTED) == 3
+    assert report["completion_status"] == "INCOMPLETE", "3 of 5 discovered is not completion"
+    with pytest.raises(SourceGovernanceError) as exc:
+        service.confirm_switch(
+            "default", report["report_id"], NEXT_PLATFORM, "license", "scope",
+            acknowledge_pending=True,
+        )
+    assert exc.value.code in ("SOURCE_CATALOG_INCOMPLETE", "CONFIRMATION_STALE")
+
+
+def test_single_active_source_cannot_be_bypassed_by_scope(tmp_path: Path) -> None:
+    """Repro 6: one installation has exactly one active source."""
+    provider = FakeGovernedProvider([item("a1")])
+    _, service = _service(tmp_path, provider)
+    _activate(service)
+
+    with pytest.raises(SourceGovernanceError) as exc:
+        service.activate_source("other-scope", NEXT_PLATFORM, "license", "scope")
+    assert exc.value.code == "SOURCE_ALREADY_ACTIVE"
+    with pytest.raises(SourceGovernanceError) as exc:
+        service.activate_source("other-scope", PLATFORM, "license", "scope")
+    assert exc.value.code == "SOURCE_ALREADY_ACTIVE"
+
+    state = service.source_state("other-scope")
+    assert state["active_source"]["platform"] == PLATFORM
+    assert state["active_source"]["cycle"] == 1
+
+
+def test_unverified_license_is_recorded_without_download(tmp_path: Path) -> None:
+    """Repro 7: authorization is confirmed before any audio is fetched."""
+    provider = FakeGovernedProvider([
+        item("unknown-license", license_status="UNKNOWN"),
+        item("uk-1", item_order=2),
+    ])
+    _, service = _service(tmp_path, provider)
+    _activate(service)
+    result = service.search(scope_id="default")
+
+    assert [candidate["provider_item_id"] for candidate in result["candidates"]] == ["uk-1"]
+    assert not any("unknown-license" in download for download in provider.downloads)
+    row = {
+        candidate["provider_item_id"]: candidate
+        for candidate in service.list_candidates("default")
+    }["unknown-license"]
+    assert row["ingestion_status"] == PENDING_REVIEW
+    assert row["failure_code"] == "LICENSE_UNVERIFIED"
+    assert row["audio_quality"] is None
+
+    report = service.report("default")
+    assert "unknown-license" in report["pending_manual_items"]
+    with pytest.raises(SourceGovernanceError) as exc:
+        service.review_candidate(row["candidate_id"], "default", decision="APPROVE", accent="en-GB")
+    assert exc.value.code == "LICENSE_UNVERIFIED"
+
+
+class _ContradictingASR:
+    """Independent ASR output that shares almost nothing with the official script."""
+
+    def transcribe(self, audio_path: str) -> list[RecognizedSegment]:
+        return [
+            RecognizedSegment(
+                text=f"Completely unrelated audio words number {index} here now.",
+                start_time=index * 1.9,
+                end_time=index * 1.9 + 1.8,
+            )
+            for index in range(32)
+        ]
+
+
+def test_transcript_contradicting_asr_stays_pending(tmp_path: Path) -> None:
+    """A declared transcript is not verified when the ASR describes other content."""
+    provider = FakeGovernedProvider([item("contradicted")])
+    database = make_database(tmp_path)
+    service = MaterialCandidateService(
+        database,
+        make_settings(tmp_path),
+        provider=provider,
+        asr=_ContradictingASR(),
+        quality=AudioQualityAnalyzer(QualityThresholds(min_duration_seconds=30.0)),
+        now_fn=lambda: NOW,
+    )
+    _activate(service)
+    result = service.search(scope_id="default")
+    assert result["candidates"] == []
+
+    row = service.list_candidates("default")[0]
+    assert row["ingestion_status"] == PENDING_REVIEW
+    assert row["failure_code"] == "TRANSCRIPT_CONTRADICTED"
+    assert row["transcript_verified"] == 1, "the declaration alone is not evidence"
+
+    with pytest.raises(MaterialSelectionError) as exc:
+        _preparation(database, tmp_path).prepare(row["candidate_id"], "default", "key-c")
+    assert exc.value.code == "SOURCE_PENDING_REVIEW"
+
+
+def test_learning_level_requires_the_eight_week_confirmation(tmp_path: Path) -> None:
+    """Repro 5: a client stage cannot unlock a higher CEFR level."""
+    provider = FakeGovernedProvider([
+        item("a1", cefr_level="A1", item_order=1),
+        item("a2", cefr_level="A2", item_order=2),
+    ])
+    database, service = _service(tmp_path, provider)
+    _activate(service)
+    result = service.search(scope_id="default", speed_stage="STAGE_3")
+    assert [candidate["provider_item_id"] for candidate in result["candidates"]] == ["a1"]
+    assert service.learning_level("default") == "A1"
+
+    by_item = {
+        candidate["provider_item_id"]: candidate["candidate_id"]
+        for candidate in service.list_candidates("default")
+    }
+    preparation = _preparation(database, tmp_path)
+    for stage in ("STAGE_1", "STAGE_2", "STAGE_3"):
+        with pytest.raises(MaterialSelectionError) as exc:
+            preparation.prepare(by_item["a2"], "default", f"key-{stage}")
+        assert exc.value.code == "LEARNING_LEVEL_NOT_CONFIRMED"
+
+    # Only the existing eight-week confirmation records may raise the ceiling.
+    clock = WeekClock()
+    weekly = WeeklyAssessmentService(database, make_settings(tmp_path), now_fn=lambda: clock.now)
+    difficulty = DifficultyProgressionService(database, weekly, now_fn=lambda: clock.now)
+    for index in range(1, 9):
+        weekly.create(
+            week_id=f"W{index}",
+            period_start="2026-01-01",
+            period_end="2026-01-07",
+            dictation_required=True,
+            reading_required=False,
+        )
+        weekly.record_dictation(f"W{index}", score=90.0, passed=True)
+        difficulty.evaluate_weekly_gate("default", f"W{index}")
+        clock.advance_weeks(1)
+    prompt = difficulty.ensure_prompt("default")
+    difficulty.decide_upgrade("default", prompt["prompt_id"], "UPGRADE_CONFIRMED", "upgrade-key")
+    assert service.learning_level("default") == "A2"
+
+    refreshed = service.search(scope_id="default")
+    assert {candidate["provider_item_id"] for candidate in refreshed["candidates"]} == {"a1", "a2"}
+    assert preparation.prepare_next("default", "key-a1")["material_id"] == f"{PLATFORM}:a1"
+    assert preparation.prepare_next("default", "key-a2")["material_id"] == f"{PLATFORM}:a2"
+
+
+def test_prepare_rechecks_the_latest_candidate_state(tmp_path: Path) -> None:
+    """Prepare validates against the latest rows inside the write transaction."""
+    provider = FakeGovernedProvider([item("a1-1", item_order=1), item("a1-2", item_order=2)])
+    database, service = _service(tmp_path, provider)
+    _activate(service)
+    result = service.search(scope_id="default")
+    by_item = {candidate["provider_item_id"]: candidate["candidate_id"] for candidate in result["candidates"]}
+
+    # A later discovery inserts an entry that now comes first in course order.
+    provider.items = [item("a1-0", item_order=0), *provider.items]
+    provider.catalog = {
+        "catalog_complete": True,
+        "known_total": 3,
+        "has_cursor": False,
+        "catalog_scope": "fixture-snapshot",
+    }
+    service.search(scope_id="default")
+
+    preparation = _preparation(database, tmp_path)
+    with pytest.raises(MaterialSelectionError) as exc:
+        preparation.prepare(by_item["a1-1"], "default", "key-late")
+    assert exc.value.code == "COURSE_ORDER_VIOLATION"
+    with database.connect() as connection:
+        assert connection.execute("SELECT COUNT(*) AS n FROM materials").fetchone()["n"] == 0
+        assert connection.execute("SELECT COUNT(*) AS n FROM sentences").fetchone()["n"] == 0
+
+
+def test_concurrent_confirmation_keeps_one_active_source(tmp_path: Path) -> None:
+    provider = FakeGovernedProvider([item("a1")])
+    database, service = _service(tmp_path, provider)
+    _activate(service)
+    service.search(scope_id="default")
+    preparation = _preparation(database, tmp_path)
+    preparation.prepare_next("default", "key-a1")
+    report = service.report("default")
+    assert report["completion_status"] == "COMPLETE"
+
+    outcomes: list[str] = []
+    lock = threading.Lock()
+
+    def worker() -> None:
+        local = MaterialCandidateService(database, make_settings(tmp_path), now_fn=lambda: NOW)
+        try:
+            local.confirm_switch(
+                "default", report["report_id"], NEXT_PLATFORM, "license", "scope",
+                acknowledge_pending=True,
+            )
+            with lock:
+                outcomes.append("switched")
+        except SourceGovernanceError as exc:
+            with lock:
+                outcomes.append(exc.code)
+
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert sorted(outcomes) == ["SOURCE_ORDER_VIOLATION", "switched"]
+    active = service.active_source("default")
+    assert active["platform"] == NEXT_PLATFORM
+    assert active["cycle"] == 2
+
+
+# ---------------------------------------------------------------------------
 # 9. Legacy entry point and API surface stay governed
 # ---------------------------------------------------------------------------
 
@@ -709,7 +1066,7 @@ def test_legacy_next_entry_refuses_without_active_source(tmp_path: Path) -> None
 
     service.candidates.activate_source("default", PLATFORM, "license", "scope")
     fetched = service.search_next()
-    assert fetched["material_id"] == "a1"
+    assert fetched["material_id"] == f"{PLATFORM}:a1"
     assert fetched["source_platform"] == PLATFORM
     assert fetched["ingestion_status"] == "INGESTED"
 
@@ -829,4 +1186,94 @@ def test_quarantined_material_is_isolated_from_the_new_weekly_pool(tmp_path: Pat
     _activate(MaterialCandidateService(database, make_settings(tmp_path), now_fn=lambda: NOW))
     with pytest.raises(ValueError, match="verified material"):
         weekly_second.create_test_items("W2", count=2)
+
+    # A non-British accent never backfills the pool, even from the active source.
+    with database.connect() as connection:
+        connection.execute(
+            "UPDATE materials SET accent = 'en-AU', license_status = 'CLEARED' WHERE material_id = 'legacy-1'"
+        )
+    weekly_third = WeeklyAssessmentService(database, make_settings(tmp_path), now_fn=lambda: NOW)
+    weekly_third.create(
+        week_id="W3",
+        period_start="2026-11-16",
+        period_end="2026-11-22",
+        dictation_required=True,
+        reading_required=False,
+    )
+    with pytest.raises(ValueError, match="verified material"):
+        weekly_third.create_test_items("W3", count=2)
+
+    # ... and an uncleared license keeps it out even with the right accent.
+    with database.connect() as connection:
+        connection.execute(
+            "UPDATE materials SET accent = 'en-GB', license_status = 'UNKNOWN' WHERE material_id = 'legacy-1'"
+        )
+    weekly_fourth = WeeklyAssessmentService(database, make_settings(tmp_path), now_fn=lambda: NOW)
+    weekly_fourth.create(
+        week_id="W4",
+        period_start="2026-11-16",
+        period_end="2026-11-22",
+        dictation_required=True,
+        reading_required=False,
+    )
+    with pytest.raises(ValueError, match="verified material"):
+        weekly_fourth.create_test_items("W4", count=2)
+
+    # Only verified material of the active source with the canonical British
+    # accent and a cleared license fills the pool.
+    with database.connect() as connection:
+        connection.execute(
+            "UPDATE materials SET license_status = 'CLEARED' WHERE material_id = 'legacy-1'"
+        )
+    weekly_fifth = WeeklyAssessmentService(database, make_settings(tmp_path), now_fn=lambda: NOW)
+    weekly_fifth.create(
+        week_id="W5",
+        period_start="2026-11-16",
+        period_end="2026-11-22",
+        dictation_required=True,
+        reading_required=False,
+    )
+    items = weekly_fifth.create_test_items("W5", count=2)
+    assert len(items) == 2
+    assert all(item["text"] in DEFAULT_SENTENCES for item in items)
+
+
+def test_quarantined_import_is_not_offered_for_new_training(tmp_path: Path) -> None:
+    """A manual import stays a viewable record but never starts new training."""
+    texts = OFFICIAL_TRANSCRIPT.split(". ")[:3]
+    original_settings = main_module.settings
+    main_module.settings = make_settings(tmp_path, "homepage.sqlite3")
+    try:
+        with TestClient(main_module.app) as client:
+            created = client.post(
+                "/api/materials",
+                json={
+                    "material_id": "manual-1",
+                    "title": "Manual import",
+                    "audio_path": "data/materials/manual-1.wav",
+                    "transcript": OFFICIAL_TRANSCRIPT,
+                    "timestamped_sentences": [
+                        {"text": text, "start_time": index * 5.0, "end_time": (index + 1) * 5.0}
+                        for index, text in enumerate(texts)
+                    ],
+                },
+            )
+            assert created.status_code == 201, created.text
+            assert created.json()["ingestion_status"] == "QUARANTINED"
+
+            # The record is preserved ...
+            assert [row["material_id"] for row in client.get("/api/materials").json()] == ["manual-1"]
+            # ... but it is not offered for a new training session.
+            assert client.get("/api/materials/available").json() == []
+
+            # Training that already started stays resumable.
+            with client.app.state.database.connect() as connection:
+                connection.execute(
+                    "UPDATE training_progress SET current_state = 'DICTATION_PART_2' WHERE material_id = 'manual-1'"
+                )
+            available = client.get("/api/materials/available").json()
+            assert [row["material_id"] for row in available] == ["manual-1"]
+            assert available[0]["current_state"] == "DICTATION_PART_2"
+    finally:
+        main_module.settings = original_settings
 

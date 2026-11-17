@@ -49,6 +49,10 @@ class AudioQuality:
     analyzer_version: str = ANALYZER_VERSION
     threshold_config_version: str = THRESHOLD_CONFIG_VERSION
     failure_code: str | None = None
+    #: True when a measured noise floor (silence windows) exists. Energy
+    #: statistics alone cannot prove the absence of music/noise, so a file
+    #: without a measurable floor is never graded "Clear".
+    noise_floor_measured: bool = False
 
     @property
     def passed(self) -> bool:
@@ -118,6 +122,12 @@ class AudioQualityAnalyzer:
             level = "Clear" if snr_db >= t.clear_min_snr_db else "Acceptable"
         elif snr_db < t.acceptable_min_snr_db:
             level = "Poor"
+        # No silent window means the noise/music floor was never measured:
+        # energy statistics alone must not claim "Clear" (no evidence of a
+        # clean recording), so the grade is capped at Acceptable.
+        noise_floor_measured = bool(silence_rms)
+        if level == "Clear" and not noise_floor_measured:
+            level = "Acceptable"
 
         return AudioQuality(
             level=level,
@@ -128,6 +138,7 @@ class AudioQualityAnalyzer:
             rms_mean=rms_mean,
             clipping_ratio=clipping_ratio,
             fingerprint=_fingerprint_of_path(audio_path),
+            noise_floor_measured=noise_floor_measured,
         )
 
 
