@@ -59,6 +59,9 @@ class Database:
             ("transcript_verified", "INTEGER NOT NULL DEFAULT 0"),
             ("license_status", "TEXT NOT NULL DEFAULT 'UNKNOWN'"),
             ("ingestion_status", "TEXT NOT NULL DEFAULT 'QUARANTINED'"),
+            # Material pool: self-measured difficulty (NULL = not scored yet).
+            ("difficulty_score", "REAL"),
+            ("difficulty_evidence", "TEXT"),
         ):
             if column not in material_columns:
                 connection.execute(f"ALTER TABLE materials ADD COLUMN {column} {definition}")

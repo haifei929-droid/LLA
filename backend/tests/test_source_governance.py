@@ -340,7 +340,10 @@ def test_non_british_accent_is_recorded_and_never_ingested(tmp_path: Path) -> No
     preparation = _preparation(database, tmp_path)
     with pytest.raises(MaterialSelectionError) as exc:
         preparation.prepare(listing["au-1"]["candidate_id"], "default", "key-au")
-    assert exc.value.code == "SOURCE_PENDING_REVIEW"
+    # The refusal is specific: the accent gate answers first ("not eligible"),
+    # while the row itself stays PENDING_REVIEW (asserted above). Either way the
+    # material is never ingested.
+    assert exc.value.code == "ACCENT_NOT_ELIGIBLE"
 
 
 # ---------------------------------------------------------------------------
@@ -1223,7 +1226,8 @@ def test_quarantined_material_is_isolated_from_the_new_weekly_pool(tmp_path: Pat
     # accent and a cleared license fills the pool.
     with database.connect() as connection:
         connection.execute(
-            "UPDATE materials SET license_status = 'CLEARED' WHERE material_id = 'legacy-1'"
+            "UPDATE materials SET license_status = 'CLEARED', source_platform = ? WHERE material_id = 'legacy-1'",
+            (PLATFORM,),
         )
     weekly_fifth = WeeklyAssessmentService(database, make_settings(tmp_path), now_fn=lambda: NOW)
     weekly_fifth.create(

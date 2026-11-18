@@ -35,6 +35,7 @@ from app.core.material_candidates import (
     is_excluded_accent,
     normalize_accent,
 )
+from app.core.material_pool import PoolSelectionError
 from app.core.material_preparation import MaterialSelectionError
 from app.core.difficulty_progression import DifficultyError
 from app.core.difficulty_history import DifficultyHistoryError
@@ -736,3 +737,24 @@ def submit_dictation(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+@router.get("/p1/pool")
+def pool_status(request: Request) -> dict[str, object]:
+    """Pool counts per gate, so an empty pool can explain itself."""
+    return request.app.state.material_pool.status()
+
+
+@router.post("/p1/pool/next")
+def pool_next(
+    request: Request,
+    preferred_source: str | None = None,
+    preferred_course: str | None = None,
+) -> dict[str, object]:
+    """Next material from the confirmed band, or 409 POOL_EMPTY."""
+    try:
+        return request.app.state.material_pool.next_material(
+            preferred_source=preferred_source,
+            preferred_course=preferred_course,
+        )
+    except PoolSelectionError as exc:
+        raise HTTPException(status_code=409, detail={"code": exc.code, "message": str(exc)}) from exc

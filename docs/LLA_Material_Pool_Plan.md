@@ -6,7 +6,7 @@
   1. **接受第三档形态**：人工获取 + 本地导入，不做自动抓取；
   2. **接受路线 3**：改为"素材池 + 自建难度分级"；
   3. **硬约束：只收英音（en-GB）**。
-- 状态：**PLAN ONLY**，未改任何生产代码；待批准后进入 Implementation。
+- 状态：**IMPLEMENTED**（用户批准方案 A：周测池修复与素材池同一交付），见 §11 实施记录。
 
 ## 0. 一句话说明这个方案在解决什么
 
@@ -147,3 +147,21 @@ ValueError: No verified material matches the active training source; the weekly 
 2. 池是否允许"同一课程多来源混排"，还是保持"一次只推进一门课程"（影响连续性权重）；
 3. B2 及以上的素材是否一律拒收（当前映射表把 B2 设为不投放）；
 4. 50languages 的"个人本地特例"是否进入正式池，还是单列为"非分发实验区"。
+
+## 11. 实施记录（2026-11-18）
+
+用户决定：**周测按 A 进行**（周测池修复与素材池同一次交付）。实施内容与实测结果：
+
+| 交付项 | 落地 |
+|---|---|
+| 自建难度 | `backend/app/core/difficulty_scoring.py`：句间停顿 / WPM / 句长 → 0–100 分 → A1–B2 档；`CALIBRATION_VERSION = v0-uncalibrated` 随分存储 |
+| 素材池 | `backend/app/core/material_pool.py`：五道硬门槛 + 同源同课程延续 → 难度 → item_order → id；空档位抛 `POOL_EMPTY`，不降门槛 |
+| 人工导入 | `backend/app/core/local_import.py` + `scripts/import_local.py`：批次目录 → 隔离入库（`QUARANTINED`、口音留空、`transcript_verified=0`、时间轴按词数比例分配并记录 `timing`），`--approve` 才进池；同一来源身份重复导入幂等跳过 |
+| 数据列 | `materials.difficulty_score` / `difficulty_evidence`（schema + 迁移，旧库启动时自动加列） |
+| 接口 | `GET /api/p1/pool`（各门槛计数）、`POST /api/p1/pool/next`（409 `POOL_EMPTY`） |
+| 周测池（方案 A） | 修复 `test_quarantined_material_is_isolated_from_the_new_weekly_pool`：该用例在最后一步忘了把素材的 `source_platform` 复位到当前主源，导致"合规素材应成池"永远不成立。断言未放宽，补上该字段后通过 |
+| 口径保真 | `normalize_accent` 不再把未知口音小写化（`en-AU` 不再被存成 `en-au`）；池仍只接受规范 `en-GB` |
+
+**验证**：`pytest -q -p no:cacheprovider` → **182 passed, 0 failed**；迁移在数据库副本上验证（新增两列、`integrity ok`、原数据行数不变）；`/api/p1/pool` 返回各门槛计数、`/api/p1/pool/next` 返回 `POOL_EMPTY`。
+
+**仍未做**：难度阈值仍未标定（`v0-uncalibrated`，需 12–20 条人工评分）；未接入任何真实素材；前端未加导入/池面板（后端已有接口）。

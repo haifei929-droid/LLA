@@ -156,7 +156,10 @@ def normalize_accent(value: object) -> str | None:
         return BRITISH_ACCENT
     if token in EXCLUDED_ACCENTS:
         return US_ACCENT
-    return token
+    # Not British, not US, not "unknown": keep the original token instead of the
+    # lower-cased lookup key, so the review queue records "en-AU" and not the
+    # lossy "en-au" (the pool still only accepts the canonical en-GB).
+    return str(value).strip() or None
 
 
 def is_excluded_accent(value: object) -> bool:

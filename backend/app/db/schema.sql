@@ -41,7 +41,12 @@ CREATE TABLE IF NOT EXISTS materials (
     cefr_level TEXT,
     transcript_verified INTEGER NOT NULL DEFAULT 0,
     license_status TEXT NOT NULL DEFAULT 'UNKNOWN',
-    ingestion_status TEXT NOT NULL DEFAULT 'QUARANTINED'
+    ingestion_status TEXT NOT NULL DEFAULT 'QUARANTINED',
+    -- Self-measured difficulty (material pool plan). NULL means "not scored":
+    -- such a row is never selectable. difficulty_evidence keeps the measured
+    -- inputs and the calibration version so a recalibration stays auditable.
+    difficulty_score REAL,
+    difficulty_evidence TEXT
 );
 
 CREATE TABLE IF NOT EXISTS sentences (
