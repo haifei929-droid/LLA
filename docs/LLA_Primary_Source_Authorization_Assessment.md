@@ -246,3 +246,40 @@ what is allowed instead.
 | audio-lingua.eu | 200（**已变为赌博推广页**） | 同名域名被占用，不可用 |
 
 **方法学限制**：本评估以"条款文字"为准，不构成法律意见；BC 与 50languages 的部分条目为快照/索引复核；未对任何 mp3 做批量获取验证。
+---
+
+## 附录 A：50languages 补充核查（第二轮，2026-11-18）
+
+第一轮抓取被超长导航菜单截断，第二轮补充核查得到三点关键事实，**不改变结论，但改变可行路径**。
+
+### A.1 文字稿零授权已被直接原文确认
+
+许可页正文（本机抓取时被截断，该句由第二轮抓取确认）：
+
+> "The Creative Commons notice applies to the audio files published by 50LANGUAGES."
+> "All written content is copyrighted and remains protected. All rights reserved."
+
+这坐实了 §2.1 的判断：**CC 只覆盖音频，文字稿没有任何许可**。LLA 需要官方文字稿做逐字判分，这是唯一"必输"的一环。
+
+### A.2 官方有整包下载，不需要逐页抓取
+
+- book2 官方提供每对语言一个整包 zip，另有**单语包**（只含目标语言音轨）：
+  - 双语整包形如 `…/book2/EN/ENZH/ENZH-all.zip`
+  - 单语包形如 `…/_1language/ENEN.ZIP`
+- 体量：约 90MB / 100 课，另有 1–10 课分卷（约 10MB）
+- 课程数 100，官方定位 **CEFR A1–A2**，每课约 18 句
+- **English (UK) 与 English (US) 是两套独立音频与独立目录**（`en` vs `em`），这对"发音一致性"是四家里最好的结构性保证
+
+**但是**：托管 zip 的镜像域 `www.50idiomas.com` 的 robots.txt 为 `User-agent: * / Disallow: /`（全站禁止爬虫）。用户手工点击下载不等于爬取，但**脚本化批量下载仍是 §6 "download tools / bulk by automated means" 的射程**。
+
+### A.3 对可行路径的修正
+
+- **获取**：从"必须逐页抓"变为"存在官方整包"——若走人工获取，`ENEN.ZIP` 是最干净的入口（一个包 = 100 课，英音专用）。
+- **改编**：整包仍是"整课音频"，每课约 18 句、男女声合并在同一文件内（官方原话："Most languages have male and female voices combined in one MP3 file."）。LLA 的逐句听写**必须**切句，而 ND 不授权改编——这一堵墙没有因为整包而消失。
+- **结论**：50languages 从"三项都不成立"收紧为"**两项必须先拿书面许可（文字 + ND），一项可走人工下载**"。它是四家里**内容结构最匹配需求**的一家（100 课 / A1–A2 / 顺序固定 / 英音独立音轨），也是**授权最需要谈判**的一家。
+
+### A.4 若要向 50LANGUAGES 发询问，需一并问清的三件事
+
+1. 官方文字稿（英文原句）能否获得本地复制与展示许可；
+2. 把 mp3 切成逐句片段并生成时间轴，是否被其视为 Derivative；若是，能否出具"仅本地、单用户、不再分发"的书面豁免；
+3. `_1language/ENEN.ZIP` 内是"100 个整课文件"还是"逐句文件"——若是逐句，则问题 2 可直接消失。
