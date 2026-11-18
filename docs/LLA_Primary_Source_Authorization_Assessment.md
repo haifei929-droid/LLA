@@ -294,7 +294,7 @@ what is allowed instead.
 | **English (UK) 单语音频整包（100 课）** | https://www.50idiomas.com/_1language/ENEN.ZIP | `200`，**56.6 MB**，`application/zip` |
 | 对照：English (US) 单语音频包（**禁止使用**） | https://www.50idiomas.com/_1language/EMEM.ZIP | `200`，62.3 MB |
 | 对照：英文界面 → 其他语言双语包示例 | https://www.50idiomas.com/book2/EN/ENAD/ENAD-all.zip | `200`，101.1 MB（可证明"~100 MB / 100 课"的量级） |
-| 课程文字页（中文界面 → English UK，每课一页） | https://www.goethe-verlag.com/book2/ZH/ZHEN/ZHEN001.HTM … `/ZHEN100.HTM` | `200`（`ZHEN002.HTM` 实测 141 KB，标题"英语 UK: 中文 » 英语 UK"） |
+| 课程文字页（中文界面 → English UK，每课一页） | https://www.goethe-verlag.com/book2/ZH/ZHEN/ZHEN001.HTM … `/ZHEN100.HTM` | 16:35 曾 `200`（`ZHEN002.HTM` 141 KB）；**17:2x 复测全部 `403`（Cloudflare 挑战页）**，见 §B.1 |
 | 课程总入口（选母语/目标语言、下载按钮） | https://www.goethe-verlag.com/book2/EN/ （English UK 界面）、https://www.goethe-verlag.com/book2/ZH/ （中文界面） | `200` |
 
 **包内结构（实测）**：`ENEN.ZIP` 的中央目录里是 **100 个整课文件** `ENEN001.mp3 … ENEN100.mp3`，**没有**逐句文件。也就是说：
@@ -304,3 +304,24 @@ what is allowed instead.
 - 文字稿不在 zip 里，只能从 `ZHENnnn.HTM` 页面取，而文字"All rights reserved"。
 
 **授权边界（对个人本地使用）**：音频可非商业复制/分享并署名 Goethe Verlag GmbH（CC BY-NC-ND 3.0 US）；**不得分发修改版**、不得商用；文字无许可。因此正确用法是：**你本人下载 → 本地导入 → 仅自己训练 → 不对外分发**。
+
+### B.1 反爬现状与人工获取路径（2026-11-18 17:2x 复测）
+
+用户在浏览器打开 `ZHEN001.HTM … ZHEN100.HTM` 得到 **403**。复测结论：
+
+| 目标 | 状态 | 说明 |
+|---|---|---|
+| `goethe-verlag.com/book2/ZH/…ZHen002.HTM` 等文字页 | `403` | 返回 5,839 字节的 `Just a moment...`，即 **Cloudflare 挑战页**，不是"链接写错"或"页面不存在" |
+| `goethe-verlag.com/book2/ZH/` 首页 | `403` | 同上，说明整站对非浏览器客户端开启了人机校验 |
+| `50idiomas.com/_1language/ENEN.ZIP` | `206`（Range 1KB 测试） | **音频包仍可下载** |
+| Wayback 快照 | 部分可用 | `ZHEN002` 有 2025-12-15 快照（200）；`ZHEN001` **无**快照，故不能作为 100 课来源 |
+
+**含义**：这属于"站点主动的人机校验"，不是 LLA 可以也不应该绕过的东西（绕过即违反"不得绕过反爬"）。正确做法只有一条：**由人在浏览器里访问**（浏览器通过挑战后正常显示），再把需要的内容保存到本地。
+
+**据此确定的两步人工流程**：
+
+1. **音频**：浏览器直接下载 `ENEN.ZIP`（或命令行下载均可，实测 206）。
+2. **文字稿**：浏览器打开课程页（先访问 `https://www.goethe-verlag.com/book2/ZH/` 通过人机校验，再用站内导航进入各课），按课 `Ctrl+S` 存成 `ENEN001.html` 放进 `data/import/inbox/enen/`；然后运行
+   `.venv/Scripts/python.exe scripts/extract_phrasebook_text.py --inbox data/import/inbox/enen`
+   由本地解析器把英文课文抽成 `ENEN001.txt`（只读本地文件，不联网）。
+   解析结果是近似稿，导入时仍为 `transcript_verified = 0`，需本人核对后才可 `--approve`。
