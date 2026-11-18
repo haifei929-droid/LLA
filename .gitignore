@@ -17,3 +17,7 @@ data/materials/*
 .env
 .env.*
 !.env.example
+
+# backups and bundles must never be committed
+backups/
+*.bundle
