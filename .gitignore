@@ -21,3 +21,6 @@ data/materials/*
 # backups and bundles must never be committed
 backups/
 *.bundle
+# manually downloaded / auto-fetched material staging (never committed)
+data/import/*
+!data/import/.gitkeep

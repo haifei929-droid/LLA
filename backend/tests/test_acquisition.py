@@ -1,0 +1,75 @@
+"""Governed acquisition: policy gate, reserve planning, pack staging."""
+
+from __future__ import annotations
+
+import io
+import zipfile
+from pathlib import Path
+
+import pytest
+
+from app.core import acquisition
+
+
+def test_policy_refuses_platforms_that_forbid_automation() -> None:
+    for platform in ("BRITISH_COUNCIL", "BREAKING_NEWS_ENGLISH"):
+        with pytest.raises(acquisition.AcquisitionError) as excinfo:
+            acquisition.assert_can_automate(platform)
+        assert excinfo.value.code == "SOURCE_BLOCKED_BY_POLICY"
+    allowed = acquisition.assert_can_automate("50LANGUAGES")
+    assert allowed.audio_mode == "official-pack"
+    assert allowed.text_mode == "manual"
+
+
+def test_first_allowed_source_is_the_publisher_pack() -> None:
+    policy = acquisition.first_automation_allowed()
+    assert policy.platform == "50LANGUAGES"
+    assert policy.artifact_url and policy.artifact_url.endswith("ENEN.ZIP")
+
+
+def test_reserve_plan_math() -> None:
+    assert acquisition.reserve_plan(0, per_day=1, days=7)["shortfall"] == 7
+    assert acquisition.reserve_plan(10, per_day=1, days=7)["should_topup"] is False
+    assert acquisition.reserve_plan(3, per_day=0.5, days=7)["needed"] == 4
+    assert acquisition.reserve_plan(0, per_day=0, days=7)["shortfall"] == 0
+    with pytest.raises(acquisition.AcquisitionError):
+        acquisition.reserve_plan(0, per_day=-1, days=7)
+
+
+def test_fetch_unpacks_audio_and_writes_batch_metadata(tmp_path: Path, monkeypatch) -> None:
+    payload = io.BytesIO()
+    with zipfile.ZipFile(payload, "w") as archive:
+        archive.writestr("ENEN001.mp3", b"ID3fake-audio-1")
+        archive.writestr("ENEN002.mp3", b"ID3fake-audio-2")
+        archive.writestr("_readme.htm", b"<html>readme</html>")
+    zip_bytes = payload.getvalue()
+
+    def fake_download(url: str, target: Path) -> dict:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(zip_bytes)
+        return {"url": url, "path": str(target), "bytes": len(zip_bytes), "sha256": "deadbeef"}
+
+    monkeypatch.setattr(acquisition, "_download", fake_download)
+    result = acquisition.fetch_official_pack("50LANGUAGES", tmp_path / "inbox", batch="book2-en-uk")
+
+    batch = tmp_path / "inbox" / "book2-en-uk"
+    assert result["extracted"] == 2
+    assert sorted(p.name for p in batch.glob("*.mp3")) == ["ENEN001.mp3", "ENEN002.mp3"]
+    assert not (batch / "_readme.htm").exists()
+    metadata = (batch / "batch.json").read_text(encoding="utf-8")
+    assert "50LANGUAGES" in metadata and "BY-NC-ND-3.0-US" in metadata
+    assert result["text_required"] is True
+
+
+def test_probe_records_blockers(monkeypatch) -> None:
+    monkeypatch.setattr(acquisition, "_head", lambda url, timeout=30: {"status": 200})
+    monkeypatch.setattr(
+        acquisition,
+        "_probe_page",
+        lambda url, timeout=30: {"url": url, "status": 403, "served_challenge": True},
+    )
+    reports = {item["platform"]: item for item in acquisition.probe_all()}
+    assert reports["50LANGUAGES"]["lesson_page"]["served_challenge"] is True
+    assert reports["BRITISH_COUNCIL"]["blocker"]
+    assert reports["BREAKING_NEWS_ENGLISH"]["text_mode"] == "prohibited"
+    assert "section 6" in reports["50LANGUAGES"]["blocker"]
