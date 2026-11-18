@@ -165,3 +165,17 @@ ValueError: No verified material matches the active training source; the weekly 
 **验证**：`pytest -q -p no:cacheprovider` → **182 passed, 0 failed**；迁移在数据库副本上验证（新增两列、`integrity ok`、原数据行数不变）；`/api/p1/pool` 返回各门槛计数、`/api/p1/pool/next` 返回 `POOL_EMPTY`。
 
 **仍未做**：难度阈值仍未标定（`v0-uncalibrated`，需 12–20 条人工评分）；未接入任何真实素材；前端未加导入/池面板（后端已有接口）。
+
+## 12. ASR 草稿政策（2026-11-18 增补）
+
+音频先到、文字稿后到是常态（例如 50languages 的文字页现在被 Cloudflare 挑战挡住）。允许用本地 ASR 生成**草稿**，但草稿不是答案：
+
+| 规则 | 说明 |
+|---|---|
+| 草稿不覆盖人工稿 | `--draft-asr` 只在 `<stem>.txt` 不存在时写入，绝不覆盖已有文件 |
+| 草稿不进池 | 导入后仍是 `QUARANTINED`，`transcript_verified = 0`，`accent` 留空 |
+| 草稿的用处 | ① 给人工校对一个起点；② 顺带产出**句级真实时间戳**（`<stem>.asr.json`），比按词数比例分配准得多 |
+| 草稿不是判分标准 | 听写判分是"逐字完全正确"，ASR 错一个词就会把正确听写判错，因此必须人工校对后才能 `--approve` |
+| 依赖 | `faster-whisper` 已装在 venv（未写入 `requirements.txt`）；模型首次使用需联网下载（base ≈ 140 MB），失败时报 `ASRUnavailable` 而不是静默降级 |
+
+工作流：`--draft-asr` → 人工对照音频改错 → 普通 `import` → `--approve`。

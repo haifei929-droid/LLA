@@ -192,7 +192,8 @@ class LocalImportService:
                 failed.append({"audio": audio.name, "reason": str(error)})
                 continue
 
-            title = f"{metadata.get('title_prefix') or stem} {stem}".strip()
+            prefix = str(metadata.get("title_prefix") or "").strip()
+            title = f"{prefix} {stem}".strip() if prefix else stem
             material = MaterialPreprocessor().process(
                 material_id=material_id,
                 title=title,
