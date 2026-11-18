@@ -91,3 +91,33 @@
 2. 备份只落到同一台机器的另一块盘（`D:\CODEX\LLA-backups`），不防整机/双盘损毁；如需抗灾需外接盘或远端对象存储。
 3. 重建后的库是空的：`preset-001/002` 音频虽在磁盘上，但对应 DB 行已丢失；按现行素材治理规则重新导入会被判为 `QUARANTINED`（口音/授权未验证），需按来源治理流程重新取证。
 4. 内存转储（1.99 GB）保留在 `C:\Users\Administrator\.codex\visualizations\2026\11\17\01a1e958-3c65-7450-a5d1-f92d02da9f45\lla-server-9420.dmp`，属于取证材料，未纳入备份，可按需清理。
+## 9. 锁存与基线更新（2026-11-18 16:1x）
+
+本节记录随防护提交产生的最终状态，覆盖第 6 节中的临时 SHA。
+
+| 项目 | 最终值 |
+|---|---|
+| 数据防护提交 | `53625b4 chore(data-safety): isolate test runtime, add verified backup tooling and incident record` |
+| 治理实现提交（待 Codex 二轮 Review） | `37231ee fix(materials): close first-round governance review findings` |
+| `origin/master` | 与本地一致，已推送 |
+| 全 ref bundle（含 tags） | `D:\CODEX\LLA-backups\` 下的 `LLA-allrefs-<SHA>-<时间>.bundle`，另存一份到 `C:\Users\Administrator\LLA-backups\` |
+| 恢复方式 | `git clone <bundle> LLA-restored`，或 `git fetch <bundle> 'refs/*:refs/restored/*'` |
+| 首次真实备份 | `D:\CODEX\LLA-backups\db\language_training-20261118T081030161711Z.sqlite3`（323,584 B，integrity ok，26 张表，sha256 sidecar 校验通过） |
+| 计划任务 | `LLA Database Backup`，每日 12:00，Interactive only（仅当前用户登录时运行） |
+
+## 10. 当前测试基线（2026-11-18 实测）
+
+在 `D:\CODEX\LLA` 用 `.venv\Scripts\python.exe -m pytest -q -p no:cacheprovider` 执行：
+
+| 场景 | 结果 |
+|---|---|
+| 防护提交之后（含新增 4 条数据安全用例与 conftest 守卫） | **169 passed / 2 failed** |
+| 防护提交之前（同机同环境，仅 `test_source_governance.py`） | **30 passed / 2 failed** |
+| 把 conftest 临时改名后重跑（A/B 对照） | **2 failed，失败项完全相同** |
+
+结论：两条失败是 `37231ee` 就存在的治理缺陷，**与本防护提交无关**：
+
+1. `test_non_british_accent_is_recorded_and_never_ingested`：候选清单里的 `accent` 被写成 `en-au`，断言要求 `en-AU` —— 非英音虽然不会被入库，但记录值被小写化，与首轮审查提出的“`en-gb` 未规范化为 `en-GB`”属同类问题。
+2. `test_quarantined_material_is_isolated_from_the_new_weekly_pool`：在合规素材就位后，周测新题池仍为空（`ValueError: No verified material matches the active training source`）—— “隔离项无池”通过，但“合规后才成池”未通过。
+
+这两条属于素材治理的 Verify Gate，必须由后续修复提交解决，**不得用本次防护提交的通过情况掩盖**。
