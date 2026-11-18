@@ -325,3 +325,28 @@ what is allowed instead.
    `.venv/Scripts/python.exe scripts/extract_phrasebook_text.py --inbox data/import/inbox/enen`
    由本地解析器把英文课文抽成 `ENEN001.txt`（只读本地文件，不联网）。
    解析结果是近似稿，导入时仍为 `transcript_verified = 0`，需本人核对后才可 `--approve`。
+
+### B.2 音频与文字稿的对应粒度（2026-11-18 实测）
+
+问题：`ENEN.ZIP` 里的音频与 `ZHEN001…100.HTM` 的课文是不是"逐条对应"？
+
+**结论：课级对应成立，句级 1:1 不成立、也不能假设。**
+
+实测方法（未下载整包，只取包内 `_readme.htm` 134 KB + 前两课音频约 0.9 MB）：
+
+| 观察 | 结果 |
+|---|---|
+| zip 内容 | 101 条目：`ENEN001…100.mp3` + `_readme.htm`，**每课一个整课文件**，无逐句文件 |
+| 说明页（`_readme.htm`） | "50LANGUAGES – audio course (MP3) · 100 lessons · MP3"、"corresponds to levels A1 and A2"，附 CC BY-NC-ND 3.0 US 许可原文；**不含课文文本** |
+| 第 1 课 | 81.18 s，32 kHz 单声道，48 kbps |
+| 第 2 课 | 68.29 s，同上 |
+| 静音切分（-35 dB / 0.12 s） | 第 1 课切出 58 段、第 2 课 53 段，段长 0.37–6.17 s 抖动很大 → 静音无法稳定还原句子边界 |
+| 是否"每句男女声各读一遍" | 能量包络相邻配对相关 20/29、错位对照 9/14，**信号不足以定论**，只能人耳判定 |
+| 官方说明 | "Most languages have male and female voices combined in one MP3 file" → 同一课内多说话人 |
+
+**对实现的约束**：
+
+1. 可以按"课"配对（`ENENnnn.mp3` ↔ `ZHENnnn.HTM`），编号一致；
+2. **不能**把页面行号当作句子时间轴；现有导入是"按词数比例分配时间轴"，对整课音频只是近似，因此 `transcript_verified` 保持 0、`accent` 留空；
+3. 要做逐句听写，必须先做真实对齐（人工或强制对齐），否则"逐字完全正确"的判定会把正确听写判错；
+4. 男女声混读意味着：口音体系一致（English UK），但**说话人/发音风格不一致**——这与"尽量保持同一说话人"的原始要求冲突，整课文件无法按说话人拆开，只能整课接受或不用。
