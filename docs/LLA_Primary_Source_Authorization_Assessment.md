@@ -283,3 +283,24 @@ what is allowed instead.
 1. 官方文字稿（英文原句）能否获得本地复制与展示许可；
 2. 把 mp3 切成逐句片段并生成时间轴，是否被其视为 Derivative；若是，能否出具"仅本地、单用户、不再分发"的书面豁免；
 3. `_1language/ENEN.ZIP` 内是"100 个整课文件"还是"逐句文件"——若是逐句，则问题 2 可直接消失。
+---
+
+## 附录 B：50languages English (UK) 官方素材入口（2026-11-18 已实测）
+
+以下链接均以 HTTP `HEAD` / 单页 `GET` / zip 尾部 `Range` 请求核验，返回码与体积为实测值；**未下载任何整包音频**。
+
+| 用途 | 链接 | 实测 |
+|---|---|---|
+| **English (UK) 单语音频整包（100 课）** | https://www.50idiomas.com/_1language/ENEN.ZIP | `200`，**56.6 MB**，`application/zip` |
+| 对照：English (US) 单语音频包（**禁止使用**） | https://www.50idiomas.com/_1language/EMEM.ZIP | `200`，62.3 MB |
+| 对照：英文界面 → 其他语言双语包示例 | https://www.50idiomas.com/book2/EN/ENAD/ENAD-all.zip | `200`，101.1 MB（可证明"~100 MB / 100 课"的量级） |
+| 课程文字页（中文界面 → English UK，每课一页） | https://www.goethe-verlag.com/book2/ZH/ZHEN/ZHEN001.HTM … `/ZHEN100.HTM` | `200`（`ZHEN002.HTM` 实测 141 KB，标题"英语 UK: 中文 » 英语 UK"） |
+| 课程总入口（选母语/目标语言、下载按钮） | https://www.goethe-verlag.com/book2/EN/ （English UK 界面）、https://www.goethe-verlag.com/book2/ZH/ （中文界面） | `200` |
+
+**包内结构（实测）**：`ENEN.ZIP` 的中央目录里是 **100 个整课文件** `ENEN001.mp3 … ENEN100.mp3`，**没有**逐句文件。也就是说：
+
+- 好消息：一个包 = 100 课，A1–A2，英音专用，不需要逐页抓取；
+- 坏消息：**切句仍然必须做**（每课约 18 句、男女声混在同一文件），所以 ND 的"禁止修改"问题不会因为整包而消失；
+- 文字稿不在 zip 里，只能从 `ZHENnnn.HTM` 页面取，而文字"All rights reserved"。
+
+**授权边界（对个人本地使用）**：音频可非商业复制/分享并署名 Goethe Verlag GmbH（CC BY-NC-ND 3.0 US）；**不得分发修改版**、不得商用；文字无许可。因此正确用法是：**你本人下载 → 本地导入 → 仅自己训练 → 不对外分发**。
