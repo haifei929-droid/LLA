@@ -80,3 +80,20 @@
 4. **口音仍非自动判断**：整课音频男女声混读，自动口音识别不可靠，仍以课程标注 + 人工确认为准。
 5. **未做前端**：采集/池只有命令行与 API，无 UI。
 6. **未宣称"全自动素材库"**：音频自动、文字人工，端到端仍需一次人工审批。
+
+## E. 步骤 1 收尾：数据安全与缓存（2026-11-19）
+
+针对 Codex 复验提出的收尾项，四项改动与实测：
+
+| 问题 | 修复 | 实测 |
+|---|---|---|
+| 下载异常遗留 `.part` | 每次 fetch 前清理遗留 `.part`；下载仍写 `.part`，校验通过后原子 `replace()` 为缓存 | `test_stale_part_file_is_removed_before_fetching` 通过 |
+| 损坏旧缓存被信任 | 缓存先做 zip CRC 校验；损坏则**改名隔离为 `<name>.corrupt`**（保留证据），再重新下载 | `test_corrupt_cache_is_quarantined_then_replaced` 通过，`quarantined_cache` 字段记录路径 |
+| `--topup --dry-run` 写副作用 | 新增 `require_database()`：缺库 → `DATABASE_MISSING`（不创建文件）；缺治理表/缺池列 → `SCHEMA_OUTDATED`；schema 检查用**只读连接**（`mode=ro&immutable=1`），不做任何写入；迁移只能由 `--migrate` 显式触发 | 隔离库实测：旧库 `--topup --dry-run` → `SCHEMA_OUTDATED` 且文件哈希不变；`--migrate` 后才输出计划 |
+| 有效缓存保留 | 校验通过的缓存直接复用（`cached: true`），不重下 | `test_valid_cache_is_reused_without_downloading` 通过 |
+
+补充：`--fetch` 同样走 `require_database()`（不再 `initialize()`），因此它在缺库/旧库上只会报错，不会隐式建库或迁移。
+
+**验证纪律**：以上所有验证均在 `LTA_*` 指向的临时数据库与临时收件箱上完成，未再触碰生产库。
+
+**已知遗留（下一轮处理）**：生产库在 2026-11-18 17:53 因一次 `--topup --dry-run` 被迁移（新增 `difficulty_score`/`difficulty_evidence`，数据未变、`integrity ok`）；该缺陷本身已在本轮修复，历史副作用不可回滚，无需处理数据。

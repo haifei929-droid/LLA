@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -36,12 +37,12 @@ from app.core.acquisition import (  # noqa: E402
     fetch_official_pack,
     first_automation_allowed,
     probe_all,
+    require_database,
     reserve_plan,
 )
 from app.core.asr_draft import ASRUnavailable, write_draft  # noqa: E402
 from app.core.local_import import AUDIO_SUFFIXES, inbox_root  # noqa: E402
 from app.core.material_pool import MaterialPoolService  # noqa: E402
-from app.db.connection import Database  # noqa: E402
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -58,6 +59,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--limit", type=int, default=0, help="limit ASR drafts (0 = no limit)")
     parser.add_argument("--force", action="store_true", help="re-download / overwrite staged files")
     parser.add_argument("--dry-run", action="store_true", help="plan only, do not fetch")
+    parser.add_argument(
+        "--migrate",
+        action="store_true",
+        help="allow the database migration (back it up first); without this flag no schema change is ever made",
+    )
     args = parser.parse_args(argv)
 
     settings = Settings.from_env()
@@ -71,8 +77,7 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.fetch:
             policy = first_automation_allowed()
-            database = Database(settings)
-            database.initialize()
+            database = require_database(settings, migrate=args.migrate)
             result = fetch_official_pack(
                 database, policy.platform, root, batch=args.batch, force=args.force, scope_id=args.scope
             )
@@ -80,9 +85,16 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.topup:
-            database = Database(settings)
-            database.initialize()
-            ready = MaterialPoolService(database, scope_id=args.scope).status()["selectable_in_band"]
+            # Read-only by default: --dry-run must not migrate the schema, and a
+            # plain --topup only fetches, it never initializes the database.
+            database = require_database(settings, need_pool_schema=True, migrate=args.migrate)
+            try:
+                ready = MaterialPoolService(database, scope_id=args.scope).status()["selectable_in_band"]
+            except sqlite3.OperationalError as error:
+                raise AcquisitionError(
+                    "SCHEMA_OUTDATED",
+                    f"the database cannot serve the pool query ({error}); back it up and run once with --migrate",
+                ) from error
             plan = reserve_plan(ready, per_day=args.per_day, days=args.days)
             if plan["should_topup"] and not args.dry_run:
                 policy = first_automation_allowed()

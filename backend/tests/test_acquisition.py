@@ -164,3 +164,70 @@ def test_probe_only_touches_what_may_be_acquired(monkeypatch) -> None:
         assert reports[blocked]["probed"] is False
         assert "no request sent" in reports[blocked]["skipped"]
         assert reports[blocked]["blocker"]
+
+def test_stale_part_file_is_removed_before_fetching(tmp_path: Path, monkeypatch) -> None:
+    database = make_database(tmp_path)
+    _activate(database, tmp_path)
+    cache = tmp_path / "cache" / "ENEN.ZIP"
+    part = cache.with_suffix(".ZIP.part")
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    part.write_bytes(b"half-a-download")
+
+    calls: list[str] = []
+    _patch_download(monkeypatch, _zip_bytes(), calls)
+    result = acquisition.fetch_official_pack(database, "50LANGUAGES", tmp_path / "inbox")
+
+    assert not part.exists(), "leftover .part debris must be cleaned"
+    assert result["extracted"] == 2
+
+
+def test_corrupt_cache_is_quarantined_then_replaced(tmp_path: Path, monkeypatch) -> None:
+    database = make_database(tmp_path)
+    _activate(database, tmp_path)
+    cache = tmp_path / "cache" / "ENEN.ZIP"
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    cache.write_bytes(b"broken-cache-bytes")
+
+    calls: list[str] = []
+    _patch_download(monkeypatch, _zip_bytes(), calls)
+    result = acquisition.fetch_official_pack(database, "50LANGUAGES", tmp_path / "inbox")
+
+    corrupt = cache.with_suffix(".ZIP.corrupt")
+    assert corrupt.is_file(), "a corrupt cache is evidence, not garbage"
+    assert corrupt.read_bytes() == b"broken-cache-bytes"
+    assert result["quarantined_cache"] == str(corrupt)
+    assert acquisition.archive_is_valid(cache)
+    assert result["extracted"] == 2
+
+
+def test_require_database_never_creates_or_migrates(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+
+    with pytest.raises(acquisition.AcquisitionError) as missing:
+        acquisition.require_database(settings)
+    assert missing.value.code == "DATABASE_MISSING"
+    assert not Path(settings.database_path).exists(), "opening a CLI path must not create a database"
+
+    Path(settings.database_path).write_bytes(b"")
+    with pytest.raises(acquisition.AcquisitionError) as outdated:
+        acquisition.require_database(settings)
+    assert outdated.value.code == "SCHEMA_OUTDATED"
+    assert Path(settings.database_path).stat().st_size == 0, "no schema may be written by a read path"
+
+
+def test_require_database_reports_and_then_applies_migration(tmp_path: Path) -> None:
+    database = make_database(tmp_path)
+    settings = make_settings(tmp_path)
+    with database.connect() as connection:
+        connection.execute("ALTER TABLE materials DROP COLUMN difficulty_score")
+        connection.execute("ALTER TABLE materials DROP COLUMN difficulty_evidence")
+
+    with pytest.raises(acquisition.AcquisitionError) as outdated:
+        acquisition.require_database(settings, need_pool_schema=True)
+    assert outdated.value.code == "SCHEMA_OUTDATED"
+    assert "difficulty_score" in str(outdated.value)
+
+    migrated = acquisition.require_database(settings, need_pool_schema=True, migrate=True)
+    with migrated.connect() as connection:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(materials)")}
+    assert {"difficulty_score", "difficulty_evidence"} <= columns

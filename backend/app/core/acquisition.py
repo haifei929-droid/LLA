@@ -27,12 +27,16 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import sqlite3
 import urllib.error
 import urllib.request
 import zipfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
+
+from app.config import Settings
+from app.db.connection import Database
 
 USER_AGENT = "LLA-local-acquisition/1.0 (personal single-user study tool)"
 HTTP_TIMEOUT = 120
@@ -202,6 +206,81 @@ def reserve_plan(ready_materials: int, per_day: float = 1.0, days: int = 7) -> d
 # --------------------------------------------------------------------------- #
 # official pack fetch (single offered artifact)
 # --------------------------------------------------------------------------- #
+POOL_COLUMNS = ("difficulty_score", "difficulty_evidence")
+#: Tables the governance helpers read. A file that lacks them is not a database
+#: we may operate on, and it must not be "fixed" silently.
+REQUIRED_TABLES = ("materials", "app_metadata")
+
+
+def _inspect_readonly(path: Path) -> tuple[set[str], set[str]]:
+    """Inspect the schema with a read-only connection, so checking changes nothing.
+
+    ``Database.connect`` opens a write transaction, which makes SQLite materialise
+    a header page even when no statement changes anything; a plain "is this
+    database ready" check must not touch the file at all.
+    """
+    uri = "file:" + path.as_posix() + "?mode=ro&immutable=1"
+    connection = sqlite3.connect(uri, uri=True)
+    try:
+        tables = {
+            str(row[0])
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        columns: set[str] = set()
+        if "materials" in tables:
+            columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(materials)")}
+        return tables, columns
+    except sqlite3.DatabaseError:
+        return set(), set()
+    finally:
+        connection.close()
+
+
+def require_database(
+    settings: Settings,
+    *,
+    need_pool_schema: bool = False,
+    migrate: bool = False,
+) -> Database:
+    """Open the database *without* changing it, unless migration is requested.
+
+    Opening a SQLite path creates an empty file, and ``Database.initialize()``
+    runs schema + migrations. Both are side effects a "just check the reserve"
+    command must not have, so they are explicit here:
+
+    * a missing file is an error (the application creates it, not a CLI);
+    * a file without the governance tables is an error;
+    * a file missing the material-pool columns is an error, unless the caller
+      passes ``migrate=True`` after taking a backup.
+    """
+    path = Path(settings.database_path)
+    if not path.is_file():
+        raise AcquisitionError(
+            "DATABASE_MISSING",
+            f"no database at {path}; start the application once to create it",
+        )
+    database = Database(settings)
+    if migrate:
+        database.initialize()
+        return database
+
+    tables, columns = _inspect_readonly(path)
+    missing_tables = [name for name in REQUIRED_TABLES if name not in tables]
+    if missing_tables:
+        raise AcquisitionError(
+            "SCHEMA_OUTDATED",
+            f"database lacks {missing_tables}; start the application once (or run with --migrate after a backup)",
+        )
+    if need_pool_schema:
+        missing_columns = [name for name in POOL_COLUMNS if name not in columns]
+        if missing_columns:
+            raise AcquisitionError(
+                "SCHEMA_OUTDATED",
+                f"materials lacks {missing_columns}; back the database up and run once with --migrate",
+            )
+    return database
+
+
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -287,16 +366,31 @@ def fetch_official_pack(
     part = cache.with_suffix(cache.suffix + ".part")
     batch_dir = inbox_root / batch
 
-    if not force and cache.is_file() and archive_is_valid(cache):
-        download: dict[str, Any] = {
-            "url": policy.artifact_url,
-            "path": str(cache),
-            "bytes": cache.stat().st_size,
-            "sha256": sha256_file(cache),
-            "cached": True,
-        }
-    else:
-        part.unlink(missing_ok=True)
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    # A leftover .part is debris from an interrupted run, never a cache hit.
+    if part.exists():
+        part.unlink()
+
+    quarantined: str | None = None
+    if not force and cache.is_file():
+        if archive_is_valid(cache):
+            download: dict[str, Any] = {
+                "url": policy.artifact_url,
+                "path": str(cache),
+                "bytes": cache.stat().st_size,
+                "sha256": sha256_file(cache),
+                "cached": True,
+            }
+        else:
+            # Keep the evidence instead of silently overwriting it, then refetch.
+            corrupt = cache.with_suffix(cache.suffix + ".corrupt")
+            if corrupt.exists():
+                corrupt.unlink()
+            cache.replace(corrupt)
+            quarantined = str(corrupt)
+            download = {}
+
+    if not (not force and cache.is_file() and archive_is_valid(cache)):
         download = _download(policy.artifact_url, part)
         if not archive_is_valid(part):
             part.unlink(missing_ok=True)
@@ -336,6 +430,7 @@ def fetch_official_pack(
         "platform": policy.platform,
         "active_source": policy.platform,
         "download": download,
+        "quarantined_cache": quarantined,
         "batch_dir": str(batch_dir),
         "extracted": len(extracted),
         "text_required": True,
