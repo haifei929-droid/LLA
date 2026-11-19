@@ -82,16 +82,23 @@ class PoolSelectionError(ValueError):
 class MaterialPoolService:
     """Read-side pool queries; ingestion stays with the governed import path."""
 
-    def __init__(self, database: Database) -> None:
+    def __init__(self, database: Database, scope_id: str = "default") -> None:
         self.database = database
+        self.scope_id = scope_id
 
     # -- band -----------------------------------------------------------------
     def current_band(self) -> str:
-        """Band implied by the confirmed eight-week stage (defaults to A1)."""
+        """Band implied by the confirmed eight-week stage of *this* scope.
+
+        The profile is per scope: reading an arbitrary row would let one scope's
+        confirmed stage decide another scope's pool, which is exactly the kind of
+        cross-scope leak the governance rules forbid.
+        """
         try:
             with self.database.connect() as connection:
                 row = connection.execute(
-                    "SELECT current_stage FROM training_difficulty_profiles LIMIT 1"
+                    "SELECT current_stage FROM training_difficulty_profiles WHERE scope_id = ? LIMIT 1",
+                    (self.scope_id,),
                 ).fetchone()
         except sqlite3.Error:
             return "A1"

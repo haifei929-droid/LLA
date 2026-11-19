@@ -1,4 +1,4 @@
-"""Governed acquisition: policy gate, reserve planning, pack staging."""
+"""Governed acquisition: policy gate, active-source gate, reserve maths, atomic cache."""
 
 from __future__ import annotations
 
@@ -9,6 +9,37 @@ from pathlib import Path
 import pytest
 
 from app.core import acquisition
+from app.core.material_candidates import MaterialCandidateService
+from tests.fixtures import make_database, make_settings
+
+
+def _activate(database, tmp_path: Path, platform: str = "50LANGUAGES") -> None:
+    MaterialCandidateService(database, make_settings(tmp_path)).activate_source(
+        "default",
+        platform,
+        license_reference="fixture-license",
+        catalog_scope="fixture-scope",
+        confirmed_by="TEST",
+    )
+
+
+def _zip_bytes() -> bytes:
+    payload = io.BytesIO()
+    with zipfile.ZipFile(payload, "w") as archive:
+        archive.writestr("ENEN001.mp3", b"ID3fake-audio-1")
+        archive.writestr("ENEN002.mp3", b"ID3fake-audio-2")
+        archive.writestr("_readme.htm", b"<html>readme</html>")
+    return payload.getvalue()
+
+
+def _patch_download(monkeypatch, payload: bytes, calls: list[str]) -> None:
+    def fake(url: str, target: Path) -> dict:
+        calls.append(url)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(payload)
+        return {"url": url, "bytes": len(payload), "sha256": "deadbeef"}
+
+    monkeypatch.setattr(acquisition, "_download", fake)
 
 
 def test_policy_refuses_platforms_that_forbid_automation() -> None:
@@ -36,21 +67,27 @@ def test_reserve_plan_math() -> None:
         acquisition.reserve_plan(0, per_day=-1, days=7)
 
 
+def test_fetch_requires_the_active_source(tmp_path: Path, monkeypatch) -> None:
+    database = make_database(tmp_path)
+    _patch_download(monkeypatch, _zip_bytes(), [])
+
+    with pytest.raises(acquisition.AcquisitionError) as no_source:
+        acquisition.fetch_official_pack(database, "50LANGUAGES", tmp_path / "inbox")
+    assert no_source.value.code == "SOURCE_NOT_APPROVED"
+
+    _activate(database, tmp_path, "BRITISH_COUNCIL")
+    with pytest.raises(acquisition.AcquisitionError) as mismatch:
+        acquisition.fetch_official_pack(database, "50LANGUAGES", tmp_path / "inbox")
+    assert mismatch.value.code == "SOURCE_MISMATCH"
+
+
 def test_fetch_unpacks_audio_and_writes_batch_metadata(tmp_path: Path, monkeypatch) -> None:
-    payload = io.BytesIO()
-    with zipfile.ZipFile(payload, "w") as archive:
-        archive.writestr("ENEN001.mp3", b"ID3fake-audio-1")
-        archive.writestr("ENEN002.mp3", b"ID3fake-audio-2")
-        archive.writestr("_readme.htm", b"<html>readme</html>")
-    zip_bytes = payload.getvalue()
+    database = make_database(tmp_path)
+    _activate(database, tmp_path)
+    calls: list[str] = []
+    _patch_download(monkeypatch, _zip_bytes(), calls)
 
-    def fake_download(url: str, target: Path) -> dict:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(zip_bytes)
-        return {"url": url, "path": str(target), "bytes": len(zip_bytes), "sha256": "deadbeef"}
-
-    monkeypatch.setattr(acquisition, "_download", fake_download)
-    result = acquisition.fetch_official_pack("50LANGUAGES", tmp_path / "inbox", batch="book2-en-uk")
+    result = acquisition.fetch_official_pack(database, "50LANGUAGES", tmp_path / "inbox", batch="book2-en-uk")
 
     batch = tmp_path / "inbox" / "book2-en-uk"
     assert result["extracted"] == 2
@@ -61,15 +98,69 @@ def test_fetch_unpacks_audio_and_writes_batch_metadata(tmp_path: Path, monkeypat
     assert result["text_required"] is True
 
 
-def test_probe_records_blockers(monkeypatch) -> None:
-    monkeypatch.setattr(acquisition, "_head", lambda url, timeout=30: {"status": 200})
-    monkeypatch.setattr(
-        acquisition,
-        "_probe_page",
-        lambda url, timeout=30: {"url": url, "status": 403, "served_challenge": True},
-    )
+def test_valid_cache_is_reused_without_downloading(tmp_path: Path, monkeypatch) -> None:
+    database = make_database(tmp_path)
+    _activate(database, tmp_path)
+    calls: list[str] = []
+    _patch_download(monkeypatch, _zip_bytes(), calls)
+
+    acquisition.fetch_official_pack(database, "50LANGUAGES", tmp_path / "inbox")
+    second = acquisition.fetch_official_pack(database, "50LANGUAGES", tmp_path / "inbox")
+
+    assert len(calls) == 1, "a valid cache must not be downloaded again"
+    assert second["download"]["cached"] is True
+
+
+def test_partial_download_is_discarded_and_a_plain_retry_works(tmp_path: Path, monkeypatch) -> None:
+    database = make_database(tmp_path)
+    _activate(database, tmp_path)
+    calls: list[str] = []
+    cache = tmp_path / "cache" / "ENEN.ZIP"
+    part = cache.with_suffix(".ZIP.part")
+
+    _patch_download(monkeypatch, b"this-is-not-a-zip", calls)
+    with pytest.raises(acquisition.AcquisitionError) as excinfo:
+        acquisition.fetch_official_pack(database, "50LANGUAGES", tmp_path / "inbox")
+    assert excinfo.value.code == "INCOMPLETE_DOWNLOAD"
+    assert not cache.exists(), "an unverified download must never become the cache"
+    assert not part.exists(), "the partial file must be discarded"
+
+    _patch_download(monkeypatch, _zip_bytes(), calls)
+    result = acquisition.fetch_official_pack(database, "50LANGUAGES", tmp_path / "inbox")
+    assert result["extracted"] == 2
+    assert cache.is_file()
+
+
+def test_corrupt_cache_is_replaced_not_trusted(tmp_path: Path, monkeypatch) -> None:
+    database = make_database(tmp_path)
+    _activate(database, tmp_path)
+    cache = tmp_path / "cache" / "ENEN.ZIP"
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    cache.write_bytes(b"stale-and-broken")
+
+    calls: list[str] = []
+    _patch_download(monkeypatch, _zip_bytes(), calls)
+    result = acquisition.fetch_official_pack(database, "50LANGUAGES", tmp_path / "inbox")
+
+    assert len(calls) == 1
+    assert result["download"].get("cached") is None
+    assert acquisition.archive_is_valid(cache)
+
+
+def test_probe_only_touches_what_may_be_acquired(monkeypatch) -> None:
+    calls: list[str] = []
+
+    def fake_head(url: str, timeout: int = 30) -> dict:
+        calls.append(url)
+        return {"status": 200}
+
+    monkeypatch.setattr(acquisition, "_head", fake_head)
     reports = {item["platform"]: item for item in acquisition.probe_all()}
-    assert reports["50LANGUAGES"]["lesson_page"]["served_challenge"] is True
-    assert reports["BRITISH_COUNCIL"]["blocker"]
-    assert reports["BREAKING_NEWS_ENGLISH"]["text_mode"] == "prohibited"
+
+    assert calls == ["https://www.50idiomas.com/_1language/ENEN.ZIP"], "no request may go to a blocked page"
+    assert reports["50LANGUAGES"]["probed"] is True
     assert "section 6" in reports["50LANGUAGES"]["blocker"]
+    for blocked in ("BRITISH_COUNCIL", "BREAKING_NEWS_ENGLISH"):
+        assert reports[blocked]["probed"] is False
+        assert "no request sent" in reports[blocked]["skipped"]
+        assert reports[blocked]["blocker"]

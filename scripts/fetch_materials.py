@@ -53,6 +53,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--days", type=int, default=7, help="reserve length in days (default 7)")
     parser.add_argument("--per-day", type=float, default=1.0, help="materials consumed per day (default 1)")
     parser.add_argument("--batch", default="book2-en-uk")
+    parser.add_argument("--scope", default="default", help="governance scope for the active-source and band checks")
     parser.add_argument("--inbox", default=None)
     parser.add_argument("--limit", type=int, default=0, help="limit ASR drafts (0 = no limit)")
     parser.add_argument("--force", action="store_true", help="re-download / overwrite staged files")
@@ -70,18 +71,24 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.fetch:
             policy = first_automation_allowed()
-            result = fetch_official_pack(policy.platform, root, batch=args.batch, force=args.force)
+            database = Database(settings)
+            database.initialize()
+            result = fetch_official_pack(
+                database, policy.platform, root, batch=args.batch, force=args.force, scope_id=args.scope
+            )
             print(json.dumps({"mode": "fetch", **result}, ensure_ascii=False, indent=2))
             return 0
 
         if args.topup:
             database = Database(settings)
             database.initialize()
-            ready = MaterialPoolService(database).status()["selectable_in_band"]
+            ready = MaterialPoolService(database, scope_id=args.scope).status()["selectable_in_band"]
             plan = reserve_plan(ready, per_day=args.per_day, days=args.days)
             if plan["should_topup"] and not args.dry_run:
                 policy = first_automation_allowed()
-                plan["fetch"] = fetch_official_pack(policy.platform, root, batch=args.batch, force=args.force)
+                plan["fetch"] = fetch_official_pack(
+                    database, policy.platform, root, batch=args.batch, force=args.force, scope_id=args.scope
+                )
             elif not plan["should_topup"]:
                 plan["fetch"] = None
             print(json.dumps({"mode": "topup", **plan}, ensure_ascii=False, indent=2))

@@ -141,47 +141,26 @@ def _head(url: str, timeout: int = 30) -> dict[str, Any]:
         return {"status": None, "error": str(error)}
 
 
-_CHALLENGE_MARKERS = ("just a moment", "cf-chl", "attention required", "checking your browser", "enable javascript and cookies")
-
-
-def _probe_page(url: str, timeout: int = 30) -> dict[str, Any]:
-    """Fetch at most 2 KB and say whether it is a bot challenge, not the page."""
-    request = urllib.request.Request(
-        url, headers={"User-Agent": USER_AGENT, "Range": "bytes=0-2047"}
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            body = response.read(2048).decode("utf-8", "replace").lower()
-            challenged = any(marker in body for marker in _CHALLENGE_MARKERS)
-            return {
-                "url": url,
-                "status": response.status,
-                "bytes_read": len(body),
-                "served_challenge": challenged,
-            }
-    except urllib.error.HTTPError as error:
-        return {"url": url, "status": error.code, "served_challenge": True}
-    except (urllib.error.URLError, TimeoutError, OSError) as error:
-        return {"url": url, "status": None, "served_challenge": True, "error": str(error)}
-
-
 def probe_source(policy: SourcePolicy) -> dict[str, Any]:
-    """Reachability of what the policy says we may (or may not) fetch."""
+    """Probe only what the policy allows to be acquired.
+
+    Blocked or manually obtained sources are not touched at all: no request is
+    sent to a page we may not use, and the report carries the policy record
+    instead. Whether a forbidden page happens to answer is not knowledge this
+    tool should even collect.
+    """
     report: dict[str, Any] = {
         "platform": policy.platform,
         "audio_mode": policy.audio_mode,
         "text_mode": policy.text_mode,
         "blocker": policy.blocker,
+        "probed": False,
     }
-    if policy.artifact_url:
+    if policy.audio_mode == "official-pack" and policy.artifact_url:
         report["artifact"] = {"url": policy.artifact_url, **_head(policy.artifact_url)}
-    # The lesson pages are probed only to *record* the blocker, never to fetch text.
-    page = {
-        "50LANGUAGES": "https://www.goethe-verlag.com/book2/ZH/ZHEN/ZHEN001.HTM",
-        "BRITISH_COUNCIL": "https://learnenglish.britishcouncil.org/terms-use",
-        "BREAKING_NEWS_ENGLISH": "https://breakingnewsenglish.com/copyright.html",
-    }[policy.platform]
-    report["lesson_page"] = _probe_page(page)
+        report["probed"] = True
+    else:
+        report["skipped"] = "policy marks this source as blocked or manual; no request sent"
     return report
 
 
@@ -223,57 +202,114 @@ def reserve_plan(ready_materials: int, per_day: float = 1.0, days: int = 7) -> d
 # --------------------------------------------------------------------------- #
 # official pack fetch (single offered artifact)
 # --------------------------------------------------------------------------- #
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def archive_is_valid(path: Path) -> bool:
+    """A cache file is usable only when every member passes its CRC check."""
+    try:
+        with zipfile.ZipFile(path) as archive:
+            return archive.testzip() is None
+    except (OSError, zipfile.BadZipFile):
+        return False
+
+
+def require_active_source(database: Any, platform: str, scope_id: str = "default") -> str:
+    """Acquisition is only allowed for the platform that is currently active."""
+    from app.core.material_candidates import active_source_platform
+
+    active = active_source_platform(database, scope_id)
+    if active is None:
+        raise AcquisitionError(
+            "SOURCE_NOT_APPROVED",
+            "no active material source; activate a source before acquiring anything",
+        )
+    if str(active).upper() != platform.upper():
+        raise AcquisitionError(
+            "SOURCE_MISMATCH",
+            f"active source is {active}, so {platform} may not be acquired",
+        )
+    return str(active)
+
+
 def _download(url: str, target: Path) -> dict[str, Any]:
+    """Stream one file into a ``.part`` path; a partial file is never kept."""
     target.parent.mkdir(parents=True, exist_ok=True)
     request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     digest = hashlib.sha256()
+    received = 0
     with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT) as response, target.open("wb") as handle:
+        expected = response.headers.get("Content-Length")
         while True:
             block = response.read(1 << 20)
             if not block:
                 break
+            received += len(block)
             digest.update(block)
             handle.write(block)
-    return {"url": url, "path": str(target), "bytes": target.stat().st_size, "sha256": digest.hexdigest()}
+    if expected is not None and int(expected) != received:
+        target.unlink(missing_ok=True)
+        raise AcquisitionError(
+            "INCOMPLETE_DOWNLOAD",
+            f"expected {expected} bytes but received {received}; the partial file was discarded so a retry is a plain retry",
+        )
+    return {"url": url, "bytes": received, "sha256": digest.hexdigest()}
 
 
 def fetch_official_pack(
+    database: Any,
     platform: str,
     inbox_root: Path,
     *,
     batch: str = "book2-en-uk",
     force: bool = False,
+    scope_id: str = "default",
 ) -> dict[str, Any]:
-    """Fetch the publisher's own audio pack and stage it for the import path.
+    """Fetch the publisher's own audio pack, but only for the active source.
 
-    Nothing is registered in the database here: the pack lands in the manual
-    import inbox, ``batch.json`` records where it came from and under which
-    licence, and the governed import path still quarantines it until a human
-    approves. Auto-ingestion into the pool is intentionally *not* implemented.
+    Check order is deliberate: policy first (never automate what is forbidden),
+    then the active source (never acquire material for a platform that is not in
+    use). The archive streams into a ``.part`` file, must pass its CRC check, and
+    only then is promoted into the cache - so an interrupted download can never
+    be mistaken for a cache hit, and retrying is just running the command again.
     """
     policy = assert_can_automate(platform)
     assert policy.artifact_url is not None
+    require_active_source(database, policy.platform, scope_id)
+
     name = policy.artifact_url.rsplit("/", 1)[-1]
     cache = inbox_root.parent / "cache" / name
+    part = cache.with_suffix(cache.suffix + ".part")
     batch_dir = inbox_root / batch
 
-    if force or not cache.is_file():
-        download = _download(policy.artifact_url, cache)
-    else:
-        download = {
+    if not force and cache.is_file() and archive_is_valid(cache):
+        download: dict[str, Any] = {
             "url": policy.artifact_url,
             "path": str(cache),
             "bytes": cache.stat().st_size,
-            "sha256": hashlib.sha256(cache.read_bytes()).hexdigest(),
+            "sha256": sha256_file(cache),
             "cached": True,
         }
+    else:
+        part.unlink(missing_ok=True)
+        download = _download(policy.artifact_url, part)
+        if not archive_is_valid(part):
+            part.unlink(missing_ok=True)
+            raise AcquisitionError(
+                "INCOMPLETE_DOWNLOAD",
+                "downloaded archive failed its CRC check and was discarded; run the command again to retry",
+            )
+        part.replace(cache)
+        download["path"] = str(cache)
 
     batch_dir.mkdir(parents=True, exist_ok=True)
     extracted: list[str] = []
     with zipfile.ZipFile(cache) as archive:
-        broken = archive.testzip()
-        if broken is not None:
-            raise AcquisitionError("CORRUPT_ARCHIVE", f"zip member failed its CRC check: {broken}")
         for info in archive.infolist():
             if not info.filename.lower().endswith((".mp3", ".wav")):
                 continue
@@ -298,6 +334,7 @@ def fetch_official_pack(
 
     return {
         "platform": policy.platform,
+        "active_source": policy.platform,
         "download": download,
         "batch_dir": str(batch_dir),
         "extracted": len(extracted),

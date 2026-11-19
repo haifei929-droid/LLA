@@ -278,3 +278,25 @@ def test_sentence_helpers_keep_every_sentence(tmp_path: Path) -> None:
     spans = distribute_timings(sentences, 30.0)
     assert spans[0].start_time == 0.0
     assert spans[-1].end_time == pytest.approx(30.0, abs=0.01)
+
+def test_pool_band_is_read_from_the_current_scope_only(tmp_path: Path) -> None:
+    database = make_database(tmp_path)
+    _governed(database, "a1", score=20.0)
+    _governed(database, "b1", score=70.0)
+    with database.connect() as connection:
+        connection.execute(
+            "INSERT OR REPLACE INTO training_difficulty_profiles(scope_id, current_stage, updated_at)"
+            " VALUES ('default', 'STAGE_1', datetime('now'))"
+        )
+        connection.execute(
+            "INSERT OR REPLACE INTO training_difficulty_profiles(scope_id, current_stage, updated_at)"
+            " VALUES ('other', 'STAGE_3', datetime('now'))"
+        )
+
+    default_pool = MaterialPoolService(database)
+    other_pool = MaterialPoolService(database, scope_id="other")
+
+    assert default_pool.current_band() == "A1"
+    assert other_pool.current_band() == "B1"
+    assert default_pool.next_material()["material_id"] == "a1"
+    assert other_pool.next_material()["material_id"] == "b1"
