@@ -159,3 +159,69 @@
 - ENEN001/002 的句边界需要**强制对齐**（在已有文字与音频之间按词级时间戳切片），当前按比例分配不可用；
 - 重复朗读的"只用其中一遍"尚未实现（现在时间轴覆盖两遍，听写时会听到两次）；
 - 文字稿的合法性仍依赖"个人本地使用"这一口径，不得分发。
+
+## G. 强制对齐（2026-11-19）
+
+问题：比例分配时间轴不可用（第 1 课塌成 1 段），而 ASR 逐段切分与逐字准确不可兼得。
+方案：**用人工校对后的文本 + 词级时间戳做强制对齐**，让边界来自度量而不是猜测。
+
+实现：`backend/app/core/forced_alignment.py`（`align_lines`）、`asr_draft.transcribe_words`
+（`word_timestamps=True`）、`scripts/align_transcript.py`（生成 `<stem>.aligned.json`）。
+导入时若存在对齐文件则优先使用，并把 `evidence.timing` 记作 `forced-word-alignment`；
+对齐结果里若有 `unaligned` 行，导入**直接拒绝**并要求修正，绝不编造边界。
+
+### G.1 真实音频实测（5 课，模型 small，91 秒跑完）
+
+| 课 | 对齐行数 | 未匹配行 | 词覆盖 | 检测到双读 | 覆盖时间轴 |
+|---|---|---|---|---|---|
+| ENEN001 | 1 | 0 | 1.0 | 0 | 4.0s → 70.1s |
+| ENEN002 | 4 | 0 | 1.0 | 0 | 7.0s → 61.5s |
+| ENEN003 | 22 | 0 | 1.0 | 11 | 8.7s → 81.3s |
+| ENEN004 | 20 | 0 | 0.987 | 10 | 8.6s → 82.6s |
+| ENEN005 | 19 | 0 | 1.0 | 1 | 6.8s → 105.1s |
+
+- 词覆盖 98.7%–100%，未匹配为 0 → 说明草稿文本与音频一致度足够；
+- 双读检测生效（003 有 11 处、004 有 10 处），时间轴已覆盖两遍；
+- 相邻行时间轴**无重叠**（对齐后统一收敛，见 `test_consecutive_lines_never_overlap`）。
+
+### G.2 ENEN005 对齐结果（示例，可逐行核对）
+
+| # | start | end | repeats | text |
+|---|---|---|---|---|
+| 1 | 6.84 | 11.20 | 1 | 5, countries and languages |
+| 2 | 14.00 | 16.00 | 1 | John is from London |
+| 3 | 17.78 | 22.44 | 1 | London is in Great Britain |
+| 4 | 22.44 | 25.92 | 1 | He speaks English |
+| 5 | 29.14 | 31.78 | 1 | Maria is from Madrid |
+| 6 | 31.78 | 33.80 | 1 | Madrid is in Spain |
+| 7 | 35.90 | 39.64 | 1 | She speaks Spanish |
+| 8 | 39.64 | 46.16 | 1 | Peter and Martha are from Berlin |
+| 9 | 46.16 | 48.40 | 1 | Berlin is in Germany |
+| 10 | 49.78 | 52.12 | 1 | Do both of you speak German |
+| 11 | 54.68 | 58.12 | 1 | London is a capital city |
+| 12 | 63.98 | 68.84 | 1 | Madrid and Berlin are also capital cities |
+| 13 | 68.84 | 72.04 | 1 | Capital cities are big and noisy |
+| 14 | 77.22 | 80.02 | 1 | France is in Europe |
+| 15 | 80.02 | 81.94 | 1 | Egypt is in Africa |
+| 16 | 84.02 | 86.26 | 1 | Japan is in Asia |
+| 17 | 88.36 | 91.50 | 1 | Canada is in North America |
+| 18 | 93.12 | 99.32 | 1 | Panama is in Central America |
+| 19 | 99.32 | 105.06 | 2 | Brazil is in South America |
+
+片头（0–6.8s）与片尾（105.1–114.1s，"visit www.book2.de…"）未被任何行占用，符合预期。
+
+### G.3 使用顺序
+
+```powershell
+# 1) 校对文本（每行一句）：data\import\inbox\book2-en-uk\ENEN003.txt
+# 2) 对齐（生成 <stem>.aligned.json）：
+.venv\Scripts\python.exe scripts\align_transcript.py --batch book2-en-uk --model small
+# 3) 导入（隔离）→ 审批后进池：
+.venv\Scripts\python.exe scripts\import_local.py --batch book2-en-uk --inbox data\import\inbox
+```
+
+### G.4 剩余工作
+
+- ENEN001/002 的**草稿文本本身没有分行**（1 行 / 4 行），需要按句拆开后再对齐；
+- 校对时若某句与音频不符，对齐会把它列入 `unaligned`，据此定位要改哪句；
+- 双读的"只取一遍"尚未实现（当前时间轴覆盖两遍，听写会听到两次）。

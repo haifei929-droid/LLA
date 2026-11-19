@@ -183,10 +183,24 @@ class LocalImportService:
                 skipped.append({"material_id": material_id, "reason": "DUPLICATE_IDENTITY"})
                 continue
 
+            aligned_path = audio.with_suffix(".aligned.json")
             try:
                 duration = float(self.probe(audio))
                 sentences = split_sentences(transcript_path.read_text(encoding="utf-8"))
-                spans = distribute_timings(sentences, duration)
+                spans = None
+                alignment_meta: dict[str, Any] | None = None
+                if aligned_path.is_file():
+                    alignment_meta = json.loads(aligned_path.read_text(encoding="utf-8"))
+                    pending = alignment_meta.get("unaligned") or []
+                    if pending:
+                        raise LocalImportError(
+                            "alignment left %d line(s) unmatched (%s); fix the transcript or re-run "
+                            "scripts/align_transcript.py"
+                            % (len(pending), ", ".join(str(item.get("line")) for item in pending[:5]))
+                        )
+                    spans = self._spans_from_alignment(alignment_meta)
+                if spans is None:
+                    spans = distribute_timings(sentences, duration)
                 scored = evaluate([(s.text, s.start_time, s.end_time) for s in spans], duration)
             except (LocalImportError, DifficultyInputError, OSError) as error:
                 failed.append({"audio": audio.name, "reason": str(error)})
@@ -225,7 +239,15 @@ class LocalImportService:
                 continue
 
             evidence = dict(scored["difficulty_evidence"])
-            evidence["timing"] = "proportional-word-count"
+            evidence["timing"] = "forced-word-alignment" if alignment_meta else "proportional-word-count"
+            if alignment_meta:
+                evidence["alignment"] = {
+                    "coverage": alignment_meta.get("coverage"),
+                    "lines": len(alignment_meta.get("lines") or []),
+                    "repeats": sum(
+                        1 for line in (alignment_meta.get("lines") or []) if line.get("repeats", 1) > 1
+                    ),
+                }
             evidence["accent_claim"] = metadata.get("accent_claim")
             evidence["license_reference"] = metadata.get("license_reference")
             with self.database.connect() as connection:
@@ -250,6 +272,25 @@ class LocalImportService:
             "failed": failed,
             "status": "QUARANTINED until approved",
         }
+
+    @staticmethod
+    def _spans_from_alignment(payload: dict[str, Any]) -> list[TimestampedSentence] | None:
+        """Spans straight from the alignment; refuse anything incomplete."""
+        lines = payload.get("lines") or []
+        if not lines:
+            return None
+        spans: list[TimestampedSentence] = []
+        for item in lines:
+            text = str(item.get("text") or "").strip()
+            try:
+                start = float(item["start"])
+                end = float(item["end"])
+            except (KeyError, TypeError, ValueError):
+                return None
+            if not text or start < 0 or end <= start:
+                return None
+            spans.append(TimestampedSentence(text, start, end))
+        return spans
 
     @staticmethod
     def _item_order(stem: str) -> int | None:

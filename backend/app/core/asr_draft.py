@@ -199,6 +199,48 @@ def draft_transcript(
     }
 
 
+def transcribe_words(
+    audio_path: Path,
+    *,
+    model_size: str = DEFAULT_MODEL,
+    language: str = "en",
+) -> dict[str, Any]:
+    """Word-level timestamps, the input forced alignment needs.
+
+    Whole-segment timestamps are too coarse for dictation on this material: one
+    whisper segment can hold a whole phrase pair. Words are the unit we can
+    actually align a corrected transcript against.
+    """
+    if not asr_available():
+        raise ASRUnavailable(
+            "faster-whisper is not installed; install it or provide timestamps by hand"
+        )
+    try:
+        from faster_whisper import WhisperModel
+
+        model = WhisperModel(model_size, device="cpu", compute_type="int8")
+        segments, info = model.transcribe(str(audio_path), language=language, word_timestamps=True)
+        words: list[dict[str, Any]] = []
+        for segment in segments:
+            for word in getattr(segment, "words", None) or []:
+                text = str(getattr(word, "word", "")).strip()
+                if text:
+                    words.append(
+                        {"word": text, "start": float(word.start), "end": float(word.end)}
+                    )
+    except Exception as error:  # pragma: no cover - depends on the model
+        raise ASRUnavailable(f"speech model unavailable: {error}") from error
+
+    if not words:
+        raise ASRUnavailable(f"no words recognised in {audio_path.name}")
+    return {
+        "model": model_size,
+        "language": language,
+        "duration": round(float(getattr(info, "duration", 0.0)), 3),
+        "words": words,
+    }
+
+
 def write_draft(audio_path: Path, *, model_size: str = DEFAULT_MODEL) -> dict[str, Any]:
     """Write ``<stem>.txt`` and ``<stem>.asr.json`` next to the audio.
 
