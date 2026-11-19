@@ -3,9 +3,8 @@ import DictationPanel from './DictationPanel.jsx'
 import ReadingPanel from './ReadingPanel.jsx'
 import WeeklyPanel from './WeeklyPanel.jsx'
 import CandidatePanel from './CandidatePanel.jsx'
+import MaterialImportPanel from './MaterialImportPanel.jsx'
 import P2Dashboard from './P2Dashboard.jsx'
-
-const blankMaterial = { material_id: '', title: '', audio_path: '', transcript: '' }
 
 const COMPLETED_STATES = ['LISTENING_COMPLETED', 'FULLY_COMPLETED']
 
@@ -60,8 +59,6 @@ function App() {
   const [candidateStage, setCandidateStage] = useState('STAGE_1')
   const [query, setQuery] = useState('')
   const [selected, setSelected] = useState(null)
-  const [showImport, setShowImport] = useState(false)
-  const [form, setForm] = useState(blankMaterial)
   const [message, setMessage] = useState('')
   const [comprehension, setComprehension] = useState({ rating: '30–50%', summary: '' })
   const [dictationContext, setDictationContext] = useState(null)
@@ -202,45 +199,6 @@ function App() {
         setSelected((current) => current ? { ...current, ...progress } : current)
         refresh().catch(() => {})
         setMessage('状态已更新。')
-      })
-      .catch((error) => setMessage(error.message))
-  }
-
-  const createMaterial = (event) => {
-    event.preventDefault()
-    const lines = form.transcript.split(/\r?\n/).map((line) => line.trim()).filter(Boolean)
-    if (lines.length < 3) {
-      setMessage('至少输入 3 行句子，系统才能分成三个 Part。')
-      return
-    }
-    fetch('/api/materials', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        ...form,
-        transcript: lines.join(' '),
-        timestamped_sentences: lines.map((text, index) => ({
-          text, start_time: index * 8, end_time: (index + 1) * 8,
-        })),
-      }),
-    })
-      .then(async (response) => {
-        const payload = await response.json()
-        if (!response.ok) throw new Error(payload.detail || '素材导入失败')
-        return payload
-      })
-      .then((payload) => {
-        setForm(blankMaterial)
-        setShowImport(false)
-        // A manual import carries no source evidence: it is stored isolated and
-        // must not start a new training session. The material stays visible in
-        // the material list and its records are preserved.
-        setMessage(
-          payload.ingestion_status === 'QUARANTINED'
-            ? '素材已导入为隔离素材：不进入新训练、自动选材与周测新题池，记录保留可查看。'
-            : '素材已导入。',
-        )
-        refresh().catch(() => {})
       })
       .catch((error) => setMessage(error.message))
   }
@@ -531,11 +489,12 @@ function App() {
         </>}
 
         {view === 'materials' && <section className="module">
-          <div className="section-heading light"><div><p className="eyebrow">声音训练素材</p><h2>搜索并进入训练</h2></div><button className="secondary" onClick={() => setShowImport(!showImport)}>{showImport ? '关闭导入' : '导入素材'}</button></div>
-          <form className="search-bar" onSubmit={search}><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索标题、编号或 transcript" /><button className="primary" type="submit">搜索</button></form><p className="search-hint">当前搜索范围：本地已导入素材；外部素材源将在 MaterialProvider 接入后开放。</p>
-          {showImport && <form className="import-form" onSubmit={createMaterial}><input required placeholder="素材 ID，如 lesson-001" value={form.material_id} onChange={(event) => setForm({ ...form, material_id: event.target.value })} /><input required placeholder="素材标题" value={form.title} onChange={(event) => setForm({ ...form, title: event.target.value })} /><input required placeholder="音频路径（本地文件）" value={form.audio_path} onChange={(event) => setForm({ ...form, audio_path: event.target.value })} /><textarea required placeholder="每行一句，至少 3 行" value={form.transcript} onChange={(event) => setForm({ ...form, transcript: event.target.value })} /><button className="primary" type="submit">保存为隔离素材</button></form>}
+          <div className="section-heading light"><div><p className="eyebrow">声音训练素材</p><h2>素材页闭环</h2><p className="muted">上传或获取音频 → 校对文字稿 → 对齐 → 审核入库 → 开始训练。列表直接读取后端暂存目录与素材库。</p></div></div>
+          <MaterialImportPanel onStartTraining={openMaterial} />
+          <div className="section-heading light intake-search-head"><div><p className="eyebrow">已入库素材</p><h3>搜索并进入训练</h3></div></div>
+          <form className="search-bar" onSubmit={search}><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索标题、编号或 transcript" /><button className="primary" type="submit">搜索</button></form><p className="search-hint">搜索范围：已建库素材（含隔离记录）；新素材请从上方面板导入。</p>
           {message && <p className="notice">{message}</p>}
-          <div className="result-list">{materials.length ? materials.map((material) => <button className="result-row" key={material.material_id} onClick={() => openMaterial(material.material_id)}><div><strong>{material.title}</strong><p>{material.material_id} · {Math.round(material.duration_seconds)} 秒{material.ingestion_status && material.ingestion_status !== 'INGESTED' ? ' · 隔离（仅查看）' : ''}</p></div><span>{material.current_state || material.status} →</span></button>) : <p className="empty light-text">没有匹配素材。可以先导入一个预置素材。</p>}</div>
+          <div className="result-list">{materials.length ? materials.map((material) => <button className="result-row" key={material.material_id} onClick={() => openMaterial(material.material_id)}><div><strong>{material.title}</strong><p>{material.material_id} · {Math.round(material.duration_seconds)} 秒{material.ingestion_status && material.ingestion_status !== 'INGESTED' ? ' · 隔离（仅查看）' : ''}</p></div><span>{material.current_state || material.status} →</span></button>) : <p className="empty light-text">没有匹配素材。可以在上方面板选择本地音频或获取官方音频。</p>}</div>
         </section>}
 
         {view === 'weekly' && <section className="module">

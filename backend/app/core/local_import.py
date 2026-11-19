@@ -160,110 +160,131 @@ class LocalImportService:
         return pairs
 
     # -- import ---------------------------------------------------------------
+    @staticmethod
+    def material_id_for(platform: str, course: str, stem: str) -> str:
+        """Stable identity: platform + course + file stem (content-derived when uploaded)."""
+        return f"{platform}:{course}:{stem}"
+
+    def import_one(self, batch_dir: Path, audio: Path, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Stage one audio file (plus its transcript, if any) as a quarantined material.
+
+        Idempotent by ``material_id_for``: an existing row is reported as skipped
+        instead of being duplicated, which is what makes a browser double-submit
+        harmless.
+        """
+        metadata = metadata or self._metadata(batch_dir)
+        platform = str(metadata["source_platform"])
+        course = str(metadata["source_course"])
+        stem = audio.stem
+        material_id = self.material_id_for(platform, course, stem)
+
+        with self.database.connect() as connection:
+            exists = connection.execute(
+                "SELECT 1 FROM materials WHERE material_id = ?", (material_id,)
+            ).fetchone()
+        if exists is not None:
+            return {"material_id": material_id, "skipped": "DUPLICATE_IDENTITY"}
+
+        transcript_path = audio.with_suffix(".txt")
+        if not transcript_path.is_file():
+            raise LocalImportError(f"missing transcript for {audio.name} (expected {transcript_path.name})")
+
+        aligned_path = audio.with_suffix(".aligned.json")
+        duration = float(self.probe(audio))
+        sentences = split_sentences(transcript_path.read_text(encoding="utf-8"))
+        spans = None
+        alignment_meta: dict[str, Any] | None = None
+        if aligned_path.is_file():
+            alignment_meta = json.loads(aligned_path.read_text(encoding="utf-8"))
+            pending = alignment_meta.get("unaligned") or []
+            if pending:
+                raise LocalImportError(
+                    "alignment left %d line(s) unmatched (%s); fix the transcript or re-run alignment"
+                    % (len(pending), ", ".join(str(item.get("line")) for item in pending[:5]))
+                )
+            spans = self._spans_from_alignment(alignment_meta)
+        if spans is None:
+            spans = distribute_timings(sentences, duration)
+        scored = evaluate([(s.text, s.start_time, s.end_time) for s in spans], duration)
+
+        prefix = str(metadata.get("title_prefix") or "").strip()
+        item_meta = {}
+        meta_path = audio.with_suffix(".meta.json")
+        if meta_path.is_file():
+            item_meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        title = str(item_meta.get("title") or "").strip() or (f"{prefix} {stem}".strip() if prefix else stem)
+
+        material = MaterialPreprocessor().process(
+            material_id=material_id,
+            title=title[:200],
+            audio_path=str(audio),
+            transcript=" ".join(sentences),
+            timestamped_sentences=spans,
+        )
+        self.store.create(
+            material,
+            source={
+                "source_type": "LOCAL_IMPORT",
+                "source_name": f"{platform}/{course}",
+                "source_url": metadata.get("license_reference"),
+            },
+            governance={
+                "source_platform": platform,
+                "source_course": course,
+                "item_order": item_meta.get("item_order", self._item_order(stem)),
+                "accent": None,  # never guessed at import time
+                "cefr_level": scored["cefr_level"],
+                "transcript_verified": 0,
+                "license_status": str(metadata["license_status"]).upper(),
+                "ingestion_status": "QUARANTINED",
+            },
+        )
+
+        evidence = dict(scored["difficulty_evidence"])
+        evidence["timing"] = "forced-word-alignment" if alignment_meta else "proportional-word-count"
+        if alignment_meta:
+            evidence["alignment"] = {
+                "coverage": alignment_meta.get("coverage"),
+                "lines": len(alignment_meta.get("lines") or []),
+                "repeats": sum(1 for line in (alignment_meta.get("lines") or []) if line.get("repeats", 1) > 1),
+            }
+        evidence["accent_claim"] = metadata.get("accent_claim")
+        evidence["license_reference"] = metadata.get("license_reference")
+        with self.database.connect() as connection:
+            connection.execute(
+                "UPDATE materials SET difficulty_score = ?, difficulty_evidence = ? WHERE material_id = ?",
+                (scored["difficulty_score"], json.dumps(evidence, ensure_ascii=False), material_id),
+            )
+
+        return {
+            "material_id": material_id,
+            "sentences": len(spans),
+            "duration_seconds": round(duration, 2),
+            "difficulty_score": scored["difficulty_score"],
+            "cefr_level": scored["cefr_level"],
+        }
+
     def import_batch(self, batch_dir: Path) -> dict[str, Any]:
+        """Import every audio file of a batch; per-file failures never abort the run."""
         if not batch_dir.is_dir():
             raise LocalImportError(f"batch directory not found: {batch_dir}")
         metadata = self._metadata(batch_dir)
-        platform = str(metadata["source_platform"])
-        course = str(metadata["source_course"])
         pairs = self._pairs(batch_dir)
 
         imported: list[dict[str, Any]] = []
         skipped: list[dict[str, Any]] = []
         failed: list[dict[str, Any]] = []
 
-        for audio, transcript_path in pairs:
-            stem = audio.stem
-            material_id = f"{platform}:{course}:{stem}"
-            with self.database.connect() as connection:
-                exists = connection.execute(
-                    "SELECT 1 FROM materials WHERE material_id = ?", (material_id,)
-                ).fetchone()
-            if exists is not None:
-                skipped.append({"material_id": material_id, "reason": "DUPLICATE_IDENTITY"})
-                continue
-
-            aligned_path = audio.with_suffix(".aligned.json")
+        for audio, _transcript in pairs:
             try:
-                duration = float(self.probe(audio))
-                sentences = split_sentences(transcript_path.read_text(encoding="utf-8"))
-                spans = None
-                alignment_meta: dict[str, Any] | None = None
-                if aligned_path.is_file():
-                    alignment_meta = json.loads(aligned_path.read_text(encoding="utf-8"))
-                    pending = alignment_meta.get("unaligned") or []
-                    if pending:
-                        raise LocalImportError(
-                            "alignment left %d line(s) unmatched (%s); fix the transcript or re-run "
-                            "scripts/align_transcript.py"
-                            % (len(pending), ", ".join(str(item.get("line")) for item in pending[:5]))
-                        )
-                    spans = self._spans_from_alignment(alignment_meta)
-                if spans is None:
-                    spans = distribute_timings(sentences, duration)
-                scored = evaluate([(s.text, s.start_time, s.end_time) for s in spans], duration)
-            except (LocalImportError, DifficultyInputError, OSError) as error:
-                failed.append({"audio": audio.name, "reason": str(error)})
-                continue
-
-            prefix = str(metadata.get("title_prefix") or "").strip()
-            title = f"{prefix} {stem}".strip() if prefix else stem
-            material = MaterialPreprocessor().process(
-                material_id=material_id,
-                title=title,
-                audio_path=str(audio),
-                transcript=" ".join(sentences),
-                timestamped_sentences=spans,
-            )
-            try:
-                self.store.create(
-                    material,
-                    source={
-                        "source_type": "LOCAL_IMPORT",
-                        "source_name": f"{platform}/{course}",
-                        "source_url": metadata.get("license_reference"),
-                    },
-                    governance={
-                        "source_platform": platform,
-                        "source_course": course,
-                        "item_order": self._item_order(stem),
-                        "accent": None,  # never guessed at import time
-                        "cefr_level": scored["cefr_level"],
-                        "transcript_verified": 0,
-                        "license_status": str(metadata["license_status"]).upper(),
-                        "ingestion_status": "QUARANTINED",
-                    },
-                )
-            except (sqlite3.IntegrityError, ValueError) as error:
+                result = self.import_one(batch_dir, audio, metadata)
+            except (LocalImportError, DifficultyInputError, OSError, ValueError) as error:
                 failed.append({"audio": audio.name, "reason": f"{type(error).__name__}: {error}"})
                 continue
-
-            evidence = dict(scored["difficulty_evidence"])
-            evidence["timing"] = "forced-word-alignment" if alignment_meta else "proportional-word-count"
-            if alignment_meta:
-                evidence["alignment"] = {
-                    "coverage": alignment_meta.get("coverage"),
-                    "lines": len(alignment_meta.get("lines") or []),
-                    "repeats": sum(
-                        1 for line in (alignment_meta.get("lines") or []) if line.get("repeats", 1) > 1
-                    ),
-                }
-            evidence["accent_claim"] = metadata.get("accent_claim")
-            evidence["license_reference"] = metadata.get("license_reference")
-            with self.database.connect() as connection:
-                connection.execute(
-                    "UPDATE materials SET difficulty_score = ?, difficulty_evidence = ? WHERE material_id = ?",
-                    (scored["difficulty_score"], json.dumps(evidence, ensure_ascii=False), material_id),
-                )
-            imported.append(
-                {
-                    "material_id": material_id,
-                    "sentences": len(spans),
-                    "duration_seconds": round(duration, 2),
-                    "difficulty_score": scored["difficulty_score"],
-                    "cefr_level": scored["cefr_level"],
-                }
-            )
+            if result.get("skipped"):
+                skipped.append({"material_id": result["material_id"], "reason": result["skipped"]})
+            else:
+                imported.append(result)
 
         return {
             "batch": batch_dir.name,

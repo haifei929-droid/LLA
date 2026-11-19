@@ -14,6 +14,7 @@ from app.core.progress import TrainingProgressStore
 from app.core.training_events import TrainingEventService
 from app.core.learning_time import LearningTimeService
 from app.core.material_candidates import MaterialCandidateService
+from app.core.material_intake import MaterialIntakeService
 from app.core.material_pool import MaterialPoolService
 from app.core.material_preparation import MaterialPreparationService
 from app.core.material_search import MaterialSearchService
@@ -66,6 +67,7 @@ async def lifespan(app: FastAPI):
         difficulty=app.state.difficulty,
     )
     app.state.material_pool = MaterialPoolService(database)
+    app.state.material_intake = MaterialIntakeService(database, settings)
     app.state.dashboard = DashboardService(database)
     app.state.memory = MemoryDeepeningService(database)
     yield

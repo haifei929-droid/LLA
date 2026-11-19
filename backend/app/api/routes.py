@@ -29,12 +29,17 @@ from app.api.schemas import (
     WeeklyReadingRequest,
     WeeklyTestItemDictationRequest,
     WeeklyTestItemsRequest,
+    TranscriptPayload,
+    AlignPayload,
+    ApprovePayload,
+    ActivateSourcePayload,
 )
 from app.core.material_candidates import (
     SourceGovernanceError,
     is_excluded_accent,
     normalize_accent,
 )
+from app.core.material_intake import IntakeError, MaterialIntakeService
 from app.core.material_pool import PoolSelectionError
 from app.core.material_preparation import MaterialSelectionError
 from app.core.difficulty_progression import DifficultyError
@@ -758,3 +763,110 @@ def pool_next(
         )
     except PoolSelectionError as exc:
         raise HTTPException(status_code=409, detail={"code": exc.code, "message": str(exc)}) from exc
+
+
+# --------------------------------------------------------------------------- #
+# Material intake: staged files, upload, transcript, alignment, approval.
+# Static two-segment paths under /materials/intake/... so the dynamic
+# /materials/{material_id} routes can never shadow them.
+# --------------------------------------------------------------------------- #
+def _intake(request: Request) -> MaterialIntakeService:
+    return request.app.state.material_intake
+
+
+def _intake_error(exc: IntakeError) -> HTTPException:
+    status_code = 409
+    if exc.code in ("ITEM_NOT_FOUND",):
+        status_code = 404
+    elif exc.code in (
+        "FILE_TOO_LARGE",
+        "UNSUPPORTED_AUDIO",
+        "EMPTY_UPLOAD",
+        "INVALID_ITEM",
+        "CONFIRMATION_REQUIRED",
+        "EVIDENCE_REQUIRED",
+    ):
+        status_code = 400
+    return HTTPException(status_code=status_code, detail={"code": exc.code, "message": str(exc), **exc.extra})
+
+
+@router.get("/materials/intake/items")
+def intake_items(request: Request) -> dict[str, object]:
+    """Staged material with per-item status derived from files and the database."""
+    return _intake(request).list_items()
+
+
+@router.post("/materials/intake/upload")
+async def intake_upload(
+    request: Request,
+    filename: str,
+    title: str | None = None,
+    platform: str | None = None,
+    course: str | None = None,
+    item_order: int | None = None,
+) -> dict[str, object]:
+    """Raw binary upload (no multipart dependency): the body *is* the audio file."""
+    body = await request.body()
+    try:
+        return _intake(request).stage_audio(
+            filename,
+            body,
+            title=title,
+            platform=platform,
+            course=course,
+            item_order=item_order,
+        )
+    except IntakeError as exc:
+        raise _intake_error(exc) from exc
+
+
+@router.put("/materials/intake/items/{item_id}/transcript")
+def intake_transcript(item_id: str, payload: TranscriptPayload, request: Request) -> dict[str, object]:
+    try:
+        return _intake(request).save_transcript(item_id, payload.text)
+    except IntakeError as exc:
+        raise _intake_error(exc) from exc
+
+
+@router.post("/materials/intake/items/{item_id}/align")
+def intake_align(item_id: str, payload: AlignPayload, request: Request) -> dict[str, object]:
+    try:
+        return _intake(request).align(item_id, model=payload.model)
+    except IntakeError as exc:
+        raise _intake_error(exc) from exc
+
+
+@router.post("/materials/intake/items/{item_id}/approve")
+def intake_approve(item_id: str, payload: ApprovePayload, request: Request) -> dict[str, object]:
+    try:
+        return _intake(request).approve(
+            item_id,
+            accent=payload.accent,
+            license_status=payload.license_status,
+            confirm=payload.confirm,
+            quality_ok=payload.quality_ok,
+            transcript_verified=payload.transcript_verified,
+        )
+    except IntakeError as exc:
+        raise _intake_error(exc) from exc
+
+
+@router.post("/materials/intake/fetch-official")
+def intake_fetch_official(request: Request) -> dict[str, object]:
+    try:
+        return _intake(request).fetch_official()
+    except IntakeError as exc:
+        raise _intake_error(exc) from exc
+
+
+@router.post("/materials/intake/activate-source")
+def intake_activate_source(payload: ActivateSourcePayload, request: Request) -> dict[str, object]:
+    try:
+        return _intake(request).activate_source(
+            platform=payload.platform,
+            license_reference=payload.license_reference,
+            catalog_scope=payload.catalog_scope,
+            confirm=payload.confirm,
+        )
+    except IntakeError as exc:
+        raise _intake_error(exc) from exc

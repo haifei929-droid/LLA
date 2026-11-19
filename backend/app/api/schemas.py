@@ -164,3 +164,32 @@ class P2SuggestionActionRequest(BaseModel):
     scope_id: str = Field(default="default")
     action: str
     target: str | None = None
+
+
+class TranscriptPayload(BaseModel):
+    """A corrected transcript: one sentence per line."""
+
+    text: str
+
+
+class AlignPayload(BaseModel):
+    """Explicit model choice; alignment never downloads a model on its own."""
+
+    model: str = "small"
+
+
+class ApprovePayload(BaseModel):
+    """The reviewer's explicit decisions. The server re-checks every one of them."""
+
+    accent: str
+    license_status: str
+    transcript_verified: bool = False
+    quality_ok: bool = False
+    confirm: bool = False
+
+
+class ActivateSourcePayload(BaseModel):
+    platform: str
+    license_reference: str
+    catalog_scope: str
+    confirm: bool = False
