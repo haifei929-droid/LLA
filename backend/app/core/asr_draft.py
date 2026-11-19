@@ -41,21 +41,42 @@ def _clean(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-def merge_segments(segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Merge over-split ASR segments into sentence-ish units.
+_TERMINAL = re.compile(r"[.!?]['\"]?$")
+#: A segment that ends on one of these is a fragment, not a finished sentence.
+_DANGLING_TAIL = frozenset(
+    "is are was were be been am the a an of in on at to from and or but my your his her their "
+    "our that this these those with for as do does did can could will would shall should".split()
+)
 
-    Whisper sometimes emits a new segment mid-sentence. Joining a segment with
-    the previous one while the previous text does not end with terminal
-    punctuation keeps sentences whole without throwing away the timestamps.
+
+def merge_segments(segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Join only the splits that are clearly mid-sentence.
+
+    The first version merged whenever the previous segment lacked terminal
+    punctuation, which swallowed whole lessons into one 100-second segment on
+    material whose phrases are short and sparsely punctuated. A merge now also
+    requires the continuation to start lower-case and the previous part to be
+    short, so a missing full stop can never collapse a lesson again.
     """
+    def _is_fragment(previous_text: str, continuation: str) -> bool:
+        if _TERMINAL.search(previous_text):
+            return False
+        words = previous_text.split()
+        if not words or len(words) >= 12:
+            return False
+        if continuation[:1].islower():
+            return True
+        return words[-1].lower().strip(",;:") in _DANGLING_TAIL
+
     merged: list[dict[str, Any]] = []
     for segment in segments:
         text = _clean(str(segment.get("text", "")))
         if not text:
             continue
-        if merged and not re.search(r"[.!?]['\"]?$", str(merged[-1]["text"])):
-            merged[-1]["text"] = _clean(f"{merged[-1]['text']} {text}")
-            merged[-1]["end"] = float(segment.get("end", merged[-1]["end"]))
+        previous = merged[-1] if merged else None
+        if previous is not None and _is_fragment(str(previous["text"]), text):
+            previous["text"] = _clean(f"{previous['text']} {text}")
+            previous["end"] = float(segment.get("end", previous["end"]))
         else:
             merged.append(
                 {
@@ -65,6 +86,67 @@ def merge_segments(segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 }
             )
     return merged
+
+
+#: Spoken wrappers that are not part of the lesson text: the publisher's intro
+#: ("50 languages, lesson N: title") and the closing pointer ("visit book2.de").
+_INTRO_MARKERS = ("50 languages", "fifty languages", "audio course", "book2")
+_OUTRO_MARKERS = ("book2", "wwwbook2", "for books and texts", "visit")
+
+
+def strip_wrappers(segments: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int, int]:
+    """Drop the spoken intro and outro; return the kept segments and both counts."""
+    def normalise(text: str) -> str:
+        return re.sub(r"[^a-z0-9 ]", "", text.lower())
+
+    def is_intro(text: str, index: int) -> bool:
+        normalised = normalise(text)
+        if any(marker in normalised for marker in _INTRO_MARKERS):
+            return True
+        # The spoken title ("lesson 5 countries and languages", "2. family members")
+        # only ever appears in the first couple of segments; a phrase that merely
+        # starts with a number deeper in the lesson is left alone.
+        if index < 2 and (re.match(r"^\s*(lesson\s*)?\d+\b", normalised) or "lesson" in normalised):
+            return True
+        return False
+
+    start = 0
+    while start < len(segments) and is_intro(str(segments[start]["text"]), start):
+        start += 1
+    end = len(segments)
+    while end > start and any(
+        marker in normalise(str(segments[end - 1]["text"])) for marker in _OUTRO_MARKERS
+    ):
+        end -= 1
+    return segments[start:end], start, len(segments) - end
+
+
+def collapse_doubling(segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collapse consecutive repeats: book2 reads each phrase with two voices.
+
+    Returns phrases of ``{"text", "start", "end", "repeats"}`` where ``repeats``
+    is how many consecutive segments said the same thing. This matters for
+    dictation: the answer key is one line, but the audio says it twice, and the
+    timestamps must cover both utterances.
+    """
+    phrases: list[dict[str, Any]] = []
+    for segment in segments:
+        key = re.sub(r"[^a-z0-9 ]", "", str(segment["text"]).lower()).strip()
+        if phrases and key and re.sub(
+            r"[^a-z0-9 ]", "", str(phrases[-1]["text"]).lower()
+        ).strip() == key:
+            phrases[-1]["end"] = float(segment["end"])
+            phrases[-1]["repeats"] += 1
+            continue
+        phrases.append(
+            {
+                "text": segment["text"],
+                "start": float(segment["start"]),
+                "end": float(segment["end"]),
+                "repeats": 1,
+            }
+        )
+    return phrases
 
 
 def draft_transcript(
@@ -100,14 +182,20 @@ def draft_transcript(
         raise ASRUnavailable(f"speech model unavailable: {error}") from error
 
     merged = merge_segments(segments)
-    if not merged:
-        raise ASRUnavailable(f"no speech recognised in {audio_path.name}")
+    kept, intro_dropped, outro_dropped = strip_wrappers(merged)
+    if not kept:
+        raise ASRUnavailable(f"no lesson speech recognised in {audio_path.name} after dropping the wrappers")
+    phrases = collapse_doubling(kept)
     return {
         "model": model_size,
         "language": language,
         "duration": round(float(getattr(info, "duration", 0.0)), 3),
-        "segments": merged,
-        "text": " ".join(segment["text"] for segment in merged),
+        "segments": kept,
+        "phrases": phrases,
+        "dropped_intro_segments": intro_dropped,
+        "dropped_outro_segments": outro_dropped,
+        "repeated_phrases": sum(1 for phrase in phrases if phrase["repeats"] > 1),
+        "text": " ".join(phrase["text"] for phrase in phrases),
     }
 
 
@@ -122,13 +210,18 @@ def write_draft(audio_path: Path, *, model_size: str = DEFAULT_MODEL) -> dict[st
     json_path = audio_path.with_suffix(".asr.json")
     written_text = False
     if not text_path.exists():
-        text_path.write_text("\n".join(segment["text"] for segment in draft["segments"]) + "\n", encoding="utf-8")
+        lines = [phrase["text"] for phrase in draft.get("phrases") or draft["segments"]]
+        text_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
         written_text = True
     json_path.write_text(json.dumps(draft, ensure_ascii=False, indent=2), encoding="utf-8")
     return {
         "audio": audio_path.name,
         "model": draft["model"],
         "segments": len(draft["segments"]),
+        "phrases": len(draft.get("phrases") or []),
+        "repeated_phrases": draft.get("repeated_phrases", 0),
+        "dropped_intro_segments": draft.get("dropped_intro_segments", 0),
+        "dropped_outro_segments": draft.get("dropped_outro_segments", 0),
         "duration": draft["duration"],
         "text_written": written_text,
         "txt": text_path.name,

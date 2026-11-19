@@ -57,6 +57,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--scope", default="default", help="governance scope for the active-source and band checks")
     parser.add_argument("--inbox", default=None)
     parser.add_argument("--limit", type=int, default=0, help="limit ASR drafts (0 = no limit)")
+    parser.add_argument("--asr-model", default="base", help="faster-whisper model size for drafts (base/small/...)")
     parser.add_argument("--force", action="store_true", help="re-download / overwrite staged files")
     parser.add_argument("--dry-run", action="store_true", help="plan only, do not fetch")
     parser.add_argument(
@@ -116,7 +117,7 @@ def main(argv: list[str] | None = None) -> int:
                     drafted.append({"audio": audio.name, "skipped": "transcript already exists"})
                     continue
                 try:
-                    drafted.append(write_draft(audio))
+                    drafted.append(write_draft(audio, model_size=args.asr_model))
                 except ASRUnavailable as error:
                     failed.append({"audio": audio.name, "error": str(error)})
                     break  # a missing model will not fix itself for the next file
